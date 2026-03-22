@@ -397,8 +397,8 @@ foreach ($idx in $indices) {
     $selectedHosts += $availHosts[$idx]
 }
 
-if ($selectedHosts.Count -lt 2) {
-    Write-Warn 'At least 2 hosts are recommended for a workload domain.'
+if ($selectedHosts.Count -lt 3) {
+    Write-Warn 'At least 3 hosts are required for a VCF workload domain.'
 }
 
 Write-OK "$($selectedHosts.Count) host(s) selected:"
@@ -609,7 +609,7 @@ if ($nsxMode -eq 'new') {
     $nsxNodeCount = 0
     while ($nsxNodeCount -notin @(1, 3)) {
         $nsxNodeCountStr = Read-Host -Prompt 'Number of NSX Manager nodes (1 or 3)'
-        $nsxNodeCount    = [int]$nsxNodeCountStr
+        if ($nsxNodeCountStr -match '^\d+$') { $nsxNodeCount = [int]$nsxNodeCountStr }
         if ($nsxNodeCount -notin @(1, 3)) { Write-Warn 'Please enter 1 or 3.' }
     }
 
@@ -696,11 +696,12 @@ if ($nsxMode -eq 'new') {
     }
     Write-Host ''
 
-    $nsxIdx = [int](Read-Host -Prompt 'Select NSX instance to join') - 1
-    if ($nsxIdx -lt 0 -or $nsxIdx -ge $nsxList.Count) {
+    $nsxIdxStr = Read-Host -Prompt 'Select NSX instance to join'
+    if ($nsxIdxStr -notmatch '^\d+$' -or ([int]$nsxIdxStr - 1) -lt 0 -or ([int]$nsxIdxStr - 1) -ge $nsxList.Count) {
         Write-Fail 'Invalid NSX selection.'
         exit 1
     }
+    $nsxIdx = [int]$nsxIdxStr - 1
     $selectedNSX = $nsxList[$nsxIdx]
 
     $nsxSpec = @{
@@ -749,11 +750,12 @@ if ($NetworkPoolName -and $NetworkPoolName.Trim() -ne '') {
 }
 
 if (-not $selectedPool) {
-    $poolIdx = [int](Read-Host -Prompt 'Select network pool number') - 1
-    if ($poolIdx -lt 0 -or $poolIdx -ge $poolList.Count) {
+    $poolIdxStr = Read-Host -Prompt 'Select network pool number'
+    if ($poolIdxStr -notmatch '^\d+$' -or ([int]$poolIdxStr - 1) -lt 0 -or ([int]$poolIdxStr - 1) -ge $poolList.Count) {
         Write-Fail 'Invalid pool selection.'
         exit 1
     }
+    $poolIdx = [int]$poolIdxStr - 1
     $selectedPool = $poolList[$poolIdx]
 }
 
@@ -772,11 +774,12 @@ foreach ($h in $selectedHosts) {
     $vmNics  = for ($j = 0; $j -lt $nicIds.Count; $j++) {
         @{ id = $nicIds[$j]; vdsName = $vdsName; uplink = $uplinkNames[$j % $uplinkNames.Count] }
     }
-    $hostSpecs += @{
+    $hostSpec = @{
         id              = $h.id
-        licenseKey      = $esxiKey
         hostNetworkSpec = @{ vmNics = $vmNics }
     }
+    if ($esxiKey) { $hostSpec['licenseKey'] = $esxiKey }
+    $hostSpecs += $hostSpec
 }
 
 # ── vSAN / datastore spec ─────────────────────────────────────────────────────
@@ -842,6 +845,7 @@ $payload = @{
                                 @{
                                     name          = "$DomainName-NSX-TEP-pg"
                                     transportType = 'NSX'
+                                    vlanId        = $nsxTepVlan
                                     activeUplinks = $uplinkNames
                                 }
                             )

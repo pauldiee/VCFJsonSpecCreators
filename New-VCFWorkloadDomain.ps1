@@ -15,7 +15,7 @@
     Paul van Dieen | hollebollevsan.nl
 
 .VERSION
-    1.4.0
+    1.5.0
 
 .CHANGELOG
     1.0.0 - Initial release
@@ -24,6 +24,7 @@
     1.2.1 - Fixed host selection to accept range input (e.g. 1-3); fixed scalar/array bug on storageType unique check
     1.3.0 - Added input validation (FQDN format, simple name, password length, license key format, output path); fixed $token loop-variable collision in host selection
     1.4.0 - Added Step 5 for VDS / network configuration: vCenter IP/gateway/subnet/size, VDS name/MTU, port-group VLAN IDs, activeUplinks, configurable geneveVlanId, optional static TEP IP pool, ESXi license key
+    1.5.0 - Removed ESXi and NSX license key fields (VCF 9 consumption-based licensing requires no per-component keys); fixed NSX TEP port group missing vlanId; fixed host count minimum to 3; fixed unsafe integer casting on selection prompts
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -39,7 +40,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region ── Pre-filled variables (leave blank to be prompted) ─────────────────
-$ScriptVersion      = '1.4.0'
+$ScriptVersion      = '1.5.0'
 $MockModeVar        = $false      # set to $true to enable mock mode without the -MockMode switch
 
 $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
@@ -67,9 +68,6 @@ $NSXTepPoolGateway  = ''          # e.g. 192.168.11.1
 $NSXTepPoolStart    = ''          # e.g. 192.168.11.50
 $NSXTepPoolEnd      = ''          # e.g. 192.168.11.70
 
-# -- ESXi:
-$ESXiLicenseKey     = ''          # common ESXi license key for all hosts (leave blank to skip)
-
 $NetworkPoolName    = ''          # existing network pool name in SDDC Manager
 
 $NSXMode            = ''          # 'new' or 'existing' (leave blank to prompt)
@@ -81,7 +79,6 @@ $NSXManager3FQDN    = ''          # e.g. nsx-wld01-m3.vcf.lab (leave blank for s
 $NSXAdminPassword   = ''          # leave blank to prompt securely
 $NSXAuditPassword   = ''          # leave blank to prompt securely
 $NSXRootPassword    = ''          # leave blank to prompt securely
-$NSXLicenseKey      = ''          # leave blank to skip (optional)
 
 $OutputJsonPath     = ''          # e.g. C:\VCF\wld-01-domain.json (leave blank to auto-generate)
 #endregion ───────────────────────────────────────────────────────────────────
@@ -574,13 +571,6 @@ if ($allTepPoolVarsSet) {
     Write-OK 'DHCP will be used for NSX TEP IP assignment.'
 }
 
-# ── ESXi license key ──────────────────────────────────────────────────────────
-$esxiLicenseInput = Get-OrPrompt -Value $ESXiLicenseKey `
-    -Prompt 'ESXi license key for all hosts (press Enter to skip)' `
-    -Optional `
-    -Validator { param($v) $v -match '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$' } `
-    -InvalidMessage 'License key must be in XXXXX-XXXXX-XXXXX-XXXXX-XXXXX format (uppercase letters and digits).'
-if ($esxiLicenseInput) { Write-OK "ESXi license key set." } else { Write-Warn 'No ESXi license key provided.' }
 #endregion ───────────────────────────────────────────────────────────────────
 
 #region ── Step 6: NSX configuration ─────────────────────────────────────────
@@ -640,11 +630,6 @@ if ($nsxMode -eq 'new') {
     $NSXRootPassword  = Get-OrPrompt -Value $NSXRootPassword  -Prompt 'NSX root password'  -Secure `
         -Validator { param($v) Test-Password $v } `
         -InvalidMessage 'Password must be at least 8 characters.'
-    $nsxLicenseInput  = Get-OrPrompt -Value $NSXLicenseKey    -Prompt 'NSX license key (press Enter to skip)' `
-        -Optional `
-        -Validator { param($v) $v -match '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$' } `
-        -InvalidMessage 'License key must be in XXXXX-XXXXX-XXXXX-XXXXX-XXXXX format (uppercase letters and digits).'
-
     $nsxManagerSpecs = @()
     foreach ($nodeFqdn in $nsxNodes) {
         $nsxManagerSpecs += @{
@@ -660,9 +645,6 @@ if ($nsxMode -eq 'new') {
         nsxManagerAdminPassword = $NSXAdminPassword
         nsxManagerAuditPassword = $NSXAuditPassword
         nsxManagerRootPassword  = $NSXRootPassword
-    }
-    if ($nsxLicenseInput -and $nsxLicenseInput.Trim() -ne '') {
-        $nsxSpec['licenseKey'] = $nsxLicenseInput
     }
     Write-OK "New NSX Manager configured ($nsxNodeCount node(s), VIP: $NSXManagerVIP)."
 
@@ -766,7 +748,6 @@ Write-OK "Network pool selected: $($selectedPool.name) (ID: $($selectedPool.id))
 Write-Header 'Step 8 of 8  |  Building JSON Payload'
 
 # ── Host specs ────────────────────────────────────────────────────────────────
-$esxiKey   = if ($esxiLicenseInput -and $esxiLicenseInput.Trim() -ne '') { $esxiLicenseInput.Trim() } else { $null }
 $hostSpecs = @()
 foreach ($h in $selectedHosts) {
     # Map each physical NIC to an uplink, cycling through the uplink list
@@ -774,12 +755,10 @@ foreach ($h in $selectedHosts) {
     $vmNics  = for ($j = 0; $j -lt $nicIds.Count; $j++) {
         @{ id = $nicIds[$j]; vdsName = $vdsName; uplink = $uplinkNames[$j % $uplinkNames.Count] }
     }
-    $hostSpec = @{
+    $hostSpecs += @{
         id              = $h.id
         hostNetworkSpec = @{ vmNics = $vmNics }
     }
-    if ($esxiKey) { $hostSpec['licenseKey'] = $esxiKey }
-    $hostSpecs += $hostSpec
 }
 
 # ── vSAN / datastore spec ─────────────────────────────────────────────────────

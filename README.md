@@ -7,7 +7,7 @@ Interactive PowerShell scripts that build, validate, and export **VMware Cloud F
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
 | `New-VCFvSANStretchSpec.ps1` | 1.1.0 | Stretch an existing cluster across two sites |
-| `New-VCFNetworkPool.ps1` | — | Create a network pool in SDDC Manager |
+| `New-VCFNetworkPool.ps1` | 2.6.0 | Create a network pool in SDDC Manager |
 
 ---
 
@@ -160,6 +160,9 @@ Pool names follow the format `NP-<cluster-name>` — for example, `cluster-mgmt-
 # Interactive -- prompts for everything
 .\New-VCFNetworkPool.ps1
 
+# Offline testing with built-in stub data
+.\New-VCFNetworkPool.ps1 -MockMode
+
 # Lab -- skip certificate validation
 .\New-VCFNetworkPool.ps1 -SkipCertCheck
 
@@ -174,6 +177,7 @@ Pool names follow the format `NP-<cluster-name>` — for example, `cluster-mgmt-
 
 | Parameter | Type | Description |
 |---|---|---|
+| `-MockMode` | Switch | Skip all SDDC Manager calls; use built-in stub data. |
 | `-SkipCertCheck` | Switch | Disables SSL/TLS certificate validation. For lab use only. |
 | `-SaveCredentials` | Switch | Encrypts and saves credentials to disk after the `Get-Credential` prompt. |
 | `-CredentialFile` | String | Path to a saved credential file. Skips the interactive credential prompt. |
@@ -199,13 +203,13 @@ JSON saved as `.\NetworkPools\NP-<cluster-name>.json`.
 
 ## Common
 
-All three scripts share the same patterns:
+All scripts share the same patterns:
 
 - **Pre-fillable variables** — populate the block at the top of each script to skip prompts
 - **Mock mode** — run with `-MockMode` or set `$MockModeVar = $true` for fully offline testing
 - **Input validation** — FQDNs, IP addresses, VLAN IDs, CIDRs, and passwords validated before the JSON is built
-- **deployWithoutLicenseKeys** — all payloads include `deployWithoutLicenseKeys: true` (VCF 9 consumption-based licensing)
 - **UTF-8 BOM output** — JSON files saved with UTF-8 BOM for compatibility with all tools
+- **deployWithoutLicenseKeys** — workload domain, cluster, and vSAN stretch payloads include `deployWithoutLicenseKeys: true` (VCF 9 consumption-based licensing)
 
 ### Requirements
 

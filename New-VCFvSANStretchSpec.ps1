@@ -16,10 +16,11 @@
     Paul van Dieen | hollebollevsan.nl
 
 .VERSION
-    1.0.0
+    1.1.0
 
 .CHANGELOG
     1.0.0 - Initial release
+    1.1.0 - Removed ESXi license key prompt; added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -35,7 +36,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region ── Pre-filled variables (leave blank to be prompted) ─────────────────
-$ScriptVersion      = '1.0.0'
+$ScriptVersion      = '1.1.0'
 $MockModeVar        = $false      # set to $true to enable mock mode without the -MockMode switch
 
 $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
@@ -52,9 +53,6 @@ $SecondaryFaultDomainName = ''    # e.g. Secondary-Site  (leave blank to prompt)
 
 # -- VDS (must match the existing cluster's VDS):
 $VDSName            = ''          # e.g. wld-01-vds01    (leave blank to prompt)
-
-# -- ESXi license key for secondary site hosts (leave blank to skip):
-$ESXiLicenseKey     = ''
 
 $OutputJsonPath     = ''          # e.g. C:\VCF\wld-01-stretch.json (leave blank to auto-generate)
 #endregion ───────────────────────────────────────────────────────────────────
@@ -456,21 +454,12 @@ $SecondaryFaultDomainName = Get-OrPrompt -Value $SecondaryFaultDomainName `
     -InvalidMessage 'Fault domain name cannot be empty.'
 Write-OK "Fault domains — Primary: $PrimaryFaultDomainName  |  Secondary: $SecondaryFaultDomainName"
 
-# ── ESXi license key ──────────────────────────────────────────────────────────
-$esxiLicenseInput = Get-OrPrompt -Value $ESXiLicenseKey `
-    -Prompt 'ESXi license key for secondary site hosts (press Enter to skip)' `
-    -Optional `
-    -Validator { param($v) $v -match '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$' } `
-    -InvalidMessage 'License key must be in XXXXX-XXXXX-XXXXX-XXXXX-XXXXX format (uppercase letters and digits).'
-if ($esxiLicenseInput) { Write-OK "ESXi license key set." } else { Write-Warn 'No ESXi license key provided.' }
 #endregion ───────────────────────────────────────────────────────────────────
 
 #region ── Step 6: Build JSON payload ────────────────────────────────────────
 Write-Header 'Step 6 of 6  |  Building JSON Payload'
 
 # ── Secondary site host specs ─────────────────────────────────────────────────
-$esxiKey = if ($esxiLicenseInput -and $esxiLicenseInput.Trim() -ne '') { $esxiLicenseInput.Trim() } else { $null }
-
 $secondaryHostSpecs = @()
 foreach ($h in $secondaryHosts) {
     $nicIds = @('vmnic0', 'vmnic1')
@@ -479,15 +468,15 @@ foreach ($h in $secondaryHosts) {
     }
     $secondaryHostSpecs += @{
         id              = $h.id
-        licenseKey      = $esxiKey
         hostNetworkSpec = @{ vmNics = $vmNics }
     }
 }
 
 # ── Full payload ──────────────────────────────────────────────────────────────
 $payload = @{
-    clusterId  = $selectedCluster.id
-    stretchSpec = @{
+    clusterId                = $selectedCluster.id
+    deployWithoutLicenseKeys = $true
+    stretchSpec              = @{
         primaryFaultDomainName   = $PrimaryFaultDomainName
         secondaryFaultDomainName = $SecondaryFaultDomainName
         witnessSpec              = @{

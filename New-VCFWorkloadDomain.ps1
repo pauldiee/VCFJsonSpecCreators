@@ -25,6 +25,7 @@
     1.3.0 - Added input validation (FQDN format, simple name, password length, license key format, output path); fixed $token loop-variable collision in host selection
     1.4.0 - Added Step 5 for VDS / network configuration: vCenter IP/gateway/subnet/size, VDS name/MTU, port-group VLAN IDs, activeUplinks, configurable geneveVlanId, optional static TEP IP pool, ESXi license key
     1.5.0 - Removed ESXi and NSX license key fields (VCF 9 consumption-based licensing requires no per-component keys); fixed NSX TEP port group missing vlanId; fixed host count minimum to 3; fixed unsafe integer casting on selection prompts
+    1.6.0 - Added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -40,7 +41,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region ── Pre-filled variables (leave blank to be prompted) ─────────────────
-$ScriptVersion      = '1.5.0'
+$ScriptVersion      = '1.6.0'
 $MockModeVar        = $false      # set to $true to enable mock mode without the -MockMode switch
 
 $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
@@ -835,8 +836,9 @@ $payload = @{
             }
         )
     }
-    nsxSpec         = $nsxSpec
-    networkPoolName = $selectedPool.name
+    nsxSpec                  = $nsxSpec
+    networkPoolName          = $selectedPool.name
+    deployWithoutLicenseKeys = $true
 }
 
 $jsonOutput = $payload | ConvertTo-Json -Depth 20

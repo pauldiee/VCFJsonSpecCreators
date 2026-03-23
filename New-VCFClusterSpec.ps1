@@ -16,10 +16,11 @@
     Paul van Dieen | hollebollevsan.nl
 
 .VERSION
-    1.0.0
+    1.1.0
 
 .CHANGELOG
     1.0.0 - Initial release
+    1.1.0 - Removed ESXi license key prompt; added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -35,7 +36,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region ── Pre-filled variables (leave blank to be prompted) ─────────────────
-$ScriptVersion      = '1.0.0'
+$ScriptVersion      = '1.1.0'
 $MockModeVar        = $false      # set to $true to enable mock mode without the -MockMode switch
 
 $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
@@ -57,9 +58,6 @@ $NSXTepPoolEnd      = ''          # e.g. 192.168.11.70
 # -- vSAN:
 $VSanDatastoreName  = ''          # leave blank to auto-generate (<ClusterName>-vSAN-DS)
 $FailuresToTolerate = ''          # 1 or 2 (leave blank to prompt)
-
-# -- ESXi:
-$ESXiLicenseKey     = ''          # common ESXi license key for all hosts (leave blank to skip)
 
 $NetworkPoolName    = ''          # existing network pool name in SDDC Manager
 
@@ -570,14 +568,6 @@ if ($allTepPoolVarsSet) {
     Write-OK 'DHCP will be used for NSX TEP IP assignment.'
 }
 
-# ── ESXi license key ──────────────────────────────────────────────────────────
-$esxiLicenseInput = Get-OrPrompt -Value $ESXiLicenseKey `
-    -Prompt 'ESXi license key for all hosts (press Enter to skip)' `
-    -Optional `
-    -Validator { param($v) $v -match '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$' } `
-    -InvalidMessage 'License key must be in XXXXX-XXXXX-XXXXX-XXXXX-XXXXX format (uppercase letters and digits).'
-if ($esxiLicenseInput) { Write-OK "ESXi license key set." } else { Write-Warn 'No ESXi license key provided.' }
-
 # ── Network pool ──────────────────────────────────────────────────────────────
 Write-Host ''
 if ($MockMode) {
@@ -629,7 +619,6 @@ Write-OK "Network pool selected: $($selectedPool.name)  (ID: $($selectedPool.id)
 Write-Header 'Step 7 of 7  |  Building JSON Payload'
 
 # ── Host specs ────────────────────────────────────────────────────────────────
-$esxiKey   = if ($esxiLicenseInput -and $esxiLicenseInput.Trim() -ne '') { $esxiLicenseInput.Trim() } else { $null }
 $hostSpecs = @()
 foreach ($h in $selectedHosts) {
     $nicIds = @('vmnic0', 'vmnic1')
@@ -638,7 +627,6 @@ foreach ($h in $selectedHosts) {
     }
     $hostSpecs += @{
         id              = $h.id
-        licenseKey      = $esxiKey
         hostNetworkSpec = @{ vmNics = $vmNics }
     }
 }
@@ -703,7 +691,8 @@ $payload = @{
             }
         )
     }
-    networkPoolName = $selectedPool.name
+    networkPoolName          = $selectedPool.name
+    deployWithoutLicenseKeys = $true
 }
 
 $jsonOutput = $payload | ConvertTo-Json -Depth 20

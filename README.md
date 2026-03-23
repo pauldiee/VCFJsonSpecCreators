@@ -1,12 +1,13 @@
 # VCF JSON Spec Creators
 
-Three interactive PowerShell wizards that build, validate, and export **VMware Cloud Foundation 9** JSON payloads via the SDDC Manager API — no manual JSON editing required.
+Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 
 | Script | Version | Purpose |
 |---|---|---|
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
 | `New-VCFvSANStretchSpec.ps1` | 1.1.0 | Stretch an existing cluster across two sites |
+| `New-VCFNetworkPool.ps1` | — | Create a network pool in SDDC Manager |
 
 ---
 
@@ -138,6 +139,61 @@ POST https://<sddc-manager>/v1/clusters/{clusterId}/stretch
 ```
 
 JSON saved as `<clusterName>-vsan-stretch-<timestamp>.json`.
+
+---
+
+## New-VCFNetworkPool.ps1
+
+### What it does
+
+1. **Input collection** — cluster name, SDDC Manager FQDN, credentials, MTU, VLAN IDs, and subnets
+2. **Input validation** — validates every field before proceeding, re-prompts on errors
+3. **Duplicate check** — verifies no pool with the same name already exists in SDDC Manager
+4. **JSON build and preview** — assembles the payload for vSAN and vMotion networks, saves to `NetworkPools\`, and shows a preview before submitting
+5. **Submit** — POSTs to `/v1/network-pools` and reports the resulting pool ID
+
+Pool names follow the format `NP-<cluster-name>` — for example, `cluster-mgmt-01a` becomes `NP-cluster-mgmt-01a`.
+
+### Usage
+
+```powershell
+# Interactive -- prompts for everything
+.\New-VCFNetworkPool.ps1
+
+# Lab -- skip certificate validation
+.\New-VCFNetworkPool.ps1 -SkipCertCheck
+
+# Save credentials for reuse
+.\New-VCFNetworkPool.ps1 -SkipCertCheck -SaveCredentials
+
+# Subsequent runs with saved credentials
+.\New-VCFNetworkPool.ps1 -SkipCertCheck -CredentialFile '.\SavedCredentials\vcf-creds.xml'
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `-SkipCertCheck` | Switch | Disables SSL/TLS certificate validation. For lab use only. |
+| `-SaveCredentials` | Switch | Encrypts and saves credentials to disk after the `Get-Credential` prompt. |
+| `-CredentialFile` | String | Path to a saved credential file. Skips the interactive credential prompt. |
+
+`-SaveCredentials` and `-CredentialFile` are mutually exclusive.
+
+### Output
+
+```
+POST https://<sddc-manager>/v1/network-pools
+```
+
+JSON saved as `.\NetworkPools\NP-<cluster-name>.json`.
+
+### Compatibility
+
+- VCF 5.0, 5.1, 5.2, and VCF 9.0
+- Windows PowerShell 5.1 and PowerShell 7.x
+
+> **VCF 9 note:** The SDDC Manager UI no longer exposes network pool management (moved to vCenter → Global Inventory List → Hosts → Network Pools), but the `/v1/network-pools` API endpoint remains fully supported.
 
 ---
 

@@ -4,6 +4,17 @@
 
 Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 
+## Workflow
+
+These scripts are the second step in a two-repo VCF deployment workflow:
+
+| Step | Repo | What it does |
+|---|---|---|
+| 1 | [VCFHostPreparation](https://github.com/pauldiee/VCFHostPreparation) | Prepares and commissions ESXi hosts into SDDC Manager |
+| 2 | **VCFJsonSpecCreators** *(this repo)* | Builds JSON payloads to create network pools, workload domains, and clusters using those hosts |
+
+Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** first. The host UUIDs returned by SDDC Manager after commissioning are what you supply to the scripts in this repo.
+
 | Script | Version | Purpose |
 |---|---|---|
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |

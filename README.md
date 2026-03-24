@@ -1,5 +1,7 @@
 # VCF JSON Spec Creators
 
+> **Disclaimer:** These scripts are provided as-is and have not been formally tested against a live VCF environment. Use at your own risk. Always validate the generated JSON payload via the SDDC Manager API's validation endpoints before submitting to production.
+
 Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 
 | Script | Version | Purpose |

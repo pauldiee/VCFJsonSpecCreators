@@ -7,7 +7,7 @@ Interactive PowerShell scripts that build, validate, and export **VMware Cloud F
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
 | `New-VCFvSANStretchSpec.ps1` | 1.1.0 | Stretch an existing cluster across two sites |
-| `New-VCFNetworkPool.ps1` | 2.6.0 | Create a network pool in SDDC Manager |
+| `New-VCFNetworkPool.ps1` | 2.7.0 | Create a network pool in SDDC Manager |
 
 ---
 
@@ -217,6 +217,22 @@ All scripts share the same patterns:
 |---|---|
 | PowerShell 5.1 or 7+ | Included with Windows 10 / Server 2016 and later |
 | SDDC Manager access | Not required in mock mode |
+
+---
+
+## Examples
+
+The [`Examples/`](Examples/) folder contains reference JSON payloads for each script — useful for understanding the expected structure before running a script, or for constructing payloads manually.
+
+| File | Description |
+|---|---|
+| [`network-pool.json`](Examples/network-pool.json) | Network pool with vSAN and vMotion networks |
+| [`workload-domain-new-nsx.json`](Examples/workload-domain-new-nsx.json) | Workload domain with a new 3-node NSX Manager |
+| [`workload-domain-existing-nsx.json`](Examples/workload-domain-existing-nsx.json) | Workload domain joining an existing NSX Manager |
+| [`cluster-spec.json`](Examples/cluster-spec.json) | New cluster added to an existing workload domain |
+| [`vsan-stretch.json`](Examples/vsan-stretch.json) | vSAN cluster stretched across two sites |
+
+See [`Examples/README.md`](Examples/README.md) for field-by-field notes on each file.
 
 ---
 

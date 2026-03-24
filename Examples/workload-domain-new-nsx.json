@@ -1,0 +1,130 @@
+{
+  "domainName": "wld-01",
+  "vcenterSpec": {
+    "name": "vcenter-wld01",
+    "networkDetailsSpec": {
+      "dnsName": "vcenter-wld01.vcf.lab",
+      "ipAddress": "192.168.10.10",
+      "gateway": "192.168.10.1",
+      "subnetMask": "255.255.255.0"
+    },
+    "rootPassword": "<rootPassword>",
+    "adminPassword": "<adminPassword>",
+    "datacenterName": "WLD-Datacenter",
+    "vmSize": "small"
+  },
+  "computeSpec": {
+    "clusterSpecs": [
+      {
+        "name": "WLD-Cluster-01",
+        "hostSpecs": [
+          {
+            "id": "aaaaaaaa-0001-0001-0001-aaaaaaaaaaaa",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-01-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-01-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "bbbbbbbb-0002-0002-0002-bbbbbbbbbbbb",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-01-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-01-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "cccccccc-0003-0003-0003-cccccccccccc",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-01-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-01-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "dddddddd-0004-0004-0004-dddddddddddd",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-01-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-01-vds01", "uplink": "uplink2" }
+              ]
+            }
+          }
+        ],
+        "vsanSpec": {
+          "esaConfig": {
+            "enabled": true
+          },
+          "failuresToTolerate": 1,
+          "datastoreName": "wld-01-vSAN-DS"
+        },
+        "networkSpec": {
+          "vdsSpecs": [
+            {
+              "name": "wld-01-vds01",
+              "mtu": 9000,
+              "portGroupSpecs": [
+                {
+                  "name": "wld-01-vMotion-pg",
+                  "transportType": "VMOTION",
+                  "vlanId": 100,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                },
+                {
+                  "name": "wld-01-vSAN-pg",
+                  "transportType": "VSAN",
+                  "vlanId": 101,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                },
+                {
+                  "name": "wld-01-nsx-tep-pg",
+                  "transportType": "NSX",
+                  "vlanId": 102,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                }
+              ]
+            }
+          ],
+          "nsxClusterSpec": {
+            "geneveVlanId": 102,
+            "ipAddressPoolsSpec": [
+              {
+                "name": "wld-01-tep-pool",
+                "subnets": [
+                  {
+                    "cidr": "192.168.11.0/24",
+                    "gateway": "192.168.11.1",
+                    "ipAddressPoolRanges": [
+                      {
+                        "start": "192.168.11.50",
+                        "end": "192.168.11.70"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "nsxSpec": {
+    "nsxManagerSpecs": [
+      { "name": "nsx-mgr-01", "networkDetails": { "fqdn": "nsx-mgr-01.vcf.lab" } },
+      { "name": "nsx-mgr-02", "networkDetails": { "fqdn": "nsx-mgr-02.vcf.lab" } },
+      { "name": "nsx-mgr-03", "networkDetails": { "fqdn": "nsx-mgr-03.vcf.lab" } }
+    ],
+    "vip": "nsx-vip.vcf.lab",
+    "vipFqdn": "nsx-vip.vcf.lab",
+    "nsxManagerAdminPassword": "<adminPassword>",
+    "nsxManagerAuditPassword": "<auditPassword>",
+    "nsxManagerRootPassword": "<rootPassword>"
+  },
+  "networkPoolName": "NP-cluster-mgmt-01a",
+  "deployWithoutLicenseKeys": true
+}

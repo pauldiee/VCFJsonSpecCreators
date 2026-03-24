@@ -14,10 +14,10 @@
 
 .NOTES
     Script  : New-VCFNetworkPool.ps1
-    Version : 2.6.0
+    Version : 2.7.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-23
+    Date    : 2026-03-24
 
     Compatibility:
         VCF 5.0, 5.1, 5.2, and VCF 9.0
@@ -40,6 +40,8 @@
         2.5.0 - Changed pool name format to NP-<full-cluster-name>
         2.6.0 - Removed invalid logout calls; added -MockMode; added pre-filled variables block;
                 aligned structure and banner with other VCF spec creator scripts
+        2.7.0 - Relaxed subnet validation to accept any valid IPv4 address (not just x.x.x.0);
+                last octet is now automatically normalized to 0 before use
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -99,10 +101,10 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFNetworkPool.ps1"
-    Version = "2.6.0"
+    Version = "2.7.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-23"
+    Date    = "2026-03-24"
 }
 
 #endregion
@@ -132,8 +134,8 @@ $ClusterName        = ''          # e.g. cluster-mgmt-01a
 $MTU                = ''          # leave blank to default to 9000
 $VSanVlanId         = ''          # e.g. 1611
 $VMotionVlanId      = ''          # e.g. 1612
-$VSanSubnet         = ''          # e.g. 172.16.11.0  (last octet must be 0, /24 assumed)
-$VMotionSubnet      = ''          # e.g. 172.16.12.0  (last octet must be 0, /24 assumed)
+$VSanSubnet         = ''          # e.g. 172.16.11.0  (/24 assumed; last octet normalized to 0)
+$VMotionSubnet      = ''          # e.g. 172.16.12.0  (/24 assumed; last octet normalized to 0)
 
 $OutputJsonPath     = ''          # leave blank to auto-generate (.\NetworkPools\NP-<cluster-name>.json)
 
@@ -240,8 +242,13 @@ function Test-IPv4Address {
 
 function Test-SubnetFormat {
     param([string]$Subnet)
-    if (-not (Test-IPv4Address -Address $Subnet)) { return $false }
-    return ($Subnet.Split('.')[3] -eq '0')
+    return (Test-IPv4Address -Address $Subnet)
+}
+
+function Get-NormalizedSubnet {
+    param([string]$Subnet)
+    $parts = $Subnet.Split('.')
+    return "$($parts[0]).$($parts[1]).$($parts[2]).0"
 }
 
 function Get-NetworkDetails {
@@ -437,8 +444,8 @@ if ($prefilledVsanVlan -and $prefilledVmotionVlan -and $prefilledVsanSubnet -and
 
         $vsanVlanInput    = (Read-Host '  vSAN VLAN ID (0-4094)').Trim()
         $vmotionVlanInput = (Read-Host '  vMotion VLAN ID (0-4094)').Trim()
-        $vsanSubnet       = (Read-Host '  vSAN subnet   (e.g. 192.168.10.0 - last octet must be 0)').Trim()
-        $vmotionSubnet    = (Read-Host '  vMotion subnet (e.g. 192.168.20.0 - last octet must be 0)').Trim()
+        $vsanSubnet       = (Read-Host '  vSAN subnet   (e.g. 192.168.10.0)').Trim()
+        $vmotionSubnet    = (Read-Host '  vMotion subnet (e.g. 192.168.20.0)').Trim()
 
         if (-not ($vsanVlanInput -match '^\d+$'))         { $inputErrors += 'vSAN VLAN ID must be a number.' }
         elseif (-not (Test-VlanId ([int]$vsanVlanInput))) { $inputErrors += "vSAN VLAN ID $vsanVlanInput is out of range (0-4094)." }
@@ -446,8 +453,8 @@ if ($prefilledVsanVlan -and $prefilledVmotionVlan -and $prefilledVsanSubnet -and
         if (-not ($vmotionVlanInput -match '^\d+$'))         { $inputErrors += 'vMotion VLAN ID must be a number.' }
         elseif (-not (Test-VlanId ([int]$vmotionVlanInput))) { $inputErrors += "vMotion VLAN ID $vmotionVlanInput is out of range (0-4094)." }
 
-        if (-not (Test-SubnetFormat $vsanSubnet))    { $inputErrors += "vSAN subnet '$vsanSubnet' is invalid. Use x.x.x.0 with valid octets (0-255)." }
-        if (-not (Test-SubnetFormat $vmotionSubnet)) { $inputErrors += "vMotion subnet '$vmotionSubnet' is invalid. Use x.x.x.0 with valid octets (0-255)." }
+        if (-not (Test-SubnetFormat $vsanSubnet))    { $inputErrors += "vSAN subnet '$vsanSubnet' is invalid. Use a valid IPv4 address (e.g. 192.168.10.0)." }
+        if (-not (Test-SubnetFormat $vmotionSubnet)) { $inputErrors += "vMotion subnet '$vmotionSubnet' is invalid. Use a valid IPv4 address (e.g. 192.168.20.0)." }
 
         if ($inputErrors.Count -gt 0) {
             $inputErrors | ForEach-Object { Write-Warning $_ }
@@ -519,6 +526,9 @@ if ($MockMode) {
 #region --- Step 3: Build and save JSON ---
 
 Write-Host ("`n  [Step 3 of 4  --  Build and Save JSON]") -ForegroundColor Cyan
+
+$vsanSubnet     = Get-NormalizedSubnet -Subnet $vsanSubnet
+$vmotionSubnet  = Get-NormalizedSubnet -Subnet $vmotionSubnet
 
 $vsanDetails    = Get-NetworkDetails -Subnet $vsanSubnet
 $vmotionDetails = Get-NetworkDetails -Subnet $vmotionSubnet

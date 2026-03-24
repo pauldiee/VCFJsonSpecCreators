@@ -1,0 +1,105 @@
+{
+  "domainId": "<workload-domain-uuid>",
+  "computeSpec": {
+    "clusterSpecs": [
+      {
+        "name": "wld-cl-02",
+        "hostSpecs": [
+          {
+            "id": "eeeeeeee-0005-0005-0005-eeeeeeeeeeee",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "ffffffff-0006-0006-0006-ffffffffffff",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "gggggggg-0007-0007-0007-gggggggggggg",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
+              ]
+            }
+          },
+          {
+            "id": "hhhhhhhh-0008-0008-0008-hhhhhhhhhhhh",
+            "hostNetworkSpec": {
+              "vmNics": [
+                { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
+                { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
+              ]
+            }
+          }
+        ],
+        "vsanSpec": {
+          "esaConfig": {
+            "enabled": true
+          },
+          "failuresToTolerate": 1,
+          "datastoreName": "wld-cl-02-vSAN-DS"
+        },
+        "networkSpec": {
+          "vdsSpecs": [
+            {
+              "name": "wld-cl-02-vds01",
+              "mtu": 9000,
+              "portGroupSpecs": [
+                {
+                  "name": "wld-cl-02-vMotion-pg",
+                  "transportType": "VMOTION",
+                  "vlanId": 100,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                },
+                {
+                  "name": "wld-cl-02-vSAN-pg",
+                  "transportType": "VSAN",
+                  "vlanId": 101,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                },
+                {
+                  "name": "wld-cl-02-nsx-tep-pg",
+                  "transportType": "NSX",
+                  "vlanId": 102,
+                  "activeUplinks": [ "uplink1", "uplink2" ]
+                }
+              ]
+            }
+          ],
+          "nsxClusterSpec": {
+            "geneveVlanId": 102,
+            "ipAddressPoolsSpec": [
+              {
+                "name": "wld-cl-02-tep-pool",
+                "subnets": [
+                  {
+                    "cidr": "192.168.11.0/24",
+                    "gateway": "192.168.11.1",
+                    "ipAddressPoolRanges": [
+                      {
+                        "start": "192.168.11.50",
+                        "end": "192.168.11.70"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "networkPoolName": "NP-cluster-mgmt-01a",
+  "deployWithoutLicenseKeys": true
+}

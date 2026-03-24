@@ -1,0 +1,43 @@
+{
+  "clusterId": "<cluster-uuid>",
+  "deployWithoutLicenseKeys": true,
+  "stretchSpec": {
+    "primaryFaultDomainName": "Preferred-Site",
+    "secondaryFaultDomainName": "Secondary-Site",
+    "witnessSpec": {
+      "fqdn": "witness.vcf.lab",
+      "vsanIp": "192.168.20.100",
+      "vsanNetmask": "255.255.255.0",
+      "vsanGateway": "192.168.20.1"
+    },
+    "secondarySiteHostSpecs": [
+      {
+        "id": "iiiiiiii-0009-0009-0009-iiiiiiiiiiii",
+        "hostNetworkSpec": {
+          "vmNics": [
+            { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
+            { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
+          ]
+        }
+      },
+      {
+        "id": "jjjjjjjj-0010-0010-0010-jjjjjjjjjjjj",
+        "hostNetworkSpec": {
+          "vmNics": [
+            { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
+            { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
+          ]
+        }
+      },
+      {
+        "id": "kkkkkkkk-0011-0011-0011-kkkkkkkkkkkk",
+        "hostNetworkSpec": {
+          "vmNics": [
+            { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
+            { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
+          ]
+        }
+      }
+    ]
+  }
+}

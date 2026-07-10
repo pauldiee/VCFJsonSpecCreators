@@ -9,11 +9,13 @@
     - Builds the clusterStretchSpec JSON payload per the VCF 9 API
     - Optionally validates via SDDC Manager API (POST /v1/clusters/{id}/validations)
     - Saves the JSON to disk (body for PATCH /v1/clusters/{id})
+    - Optionally executes the stretch (PATCH /v1/clusters/{id}) from a chosen JSON file,
+      after typed cluster-name confirmation
     - Supports mock mode for offline/lab testing without live SDDC Manager
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.0.0
+    Version : 2.1.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -26,6 +28,8 @@
             isEdgeClusterConfiguredForMultiAZ and witnessTrafficSharedWithVsanTraffic flags.
             Removed fault domain name prompts (not part of the API spec).
             Validation now uses POST /v1/clusters/{id}/validations; stretch via PATCH /v1/clusters/{id}.
+    2.1.0 - Added optional execute step: prompts for a stretch spec JSON file (defaults to the
+            one just saved) and submits PATCH /v1/clusters/{id} after typed cluster-name confirmation.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -41,7 +45,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "2.0.0"
+    Version = "2.1.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-10"
@@ -698,6 +702,63 @@ try {
     Write-Host "  JSON saved to: $OutputJsonPath" -ForegroundColor Green
 } catch {
     Write-Host "  Failed to save JSON: $_" -ForegroundColor Red
+}
+#endregion
+
+#region --- Optional: Execute stretch ---
+Write-Host ("`n  [Execute  --  Stretch Operation (optional)]") -ForegroundColor Cyan
+
+if ($MockMode) {
+    Write-Host "  [MOCK] Execution is not available in mock mode." -ForegroundColor DarkYellow
+} else {
+    $executeChoice = ''
+    while ($executeChoice -notin @('y', 'n')) {
+        $executeChoice = (Read-Host -Prompt 'Execute the stretch operation now? (y/n)').ToLower()
+        if ($executeChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
+    }
+
+    if ($executeChoice -eq 'y') {
+        $executeJsonPath = Read-Host -Prompt "Path to stretch spec JSON (press Enter for '$OutputJsonPath')"
+        if (-not $executeJsonPath -or $executeJsonPath.Trim() -eq '') { $executeJsonPath = $OutputJsonPath }
+
+        $executePayload = $null
+        try {
+            $executePayload = Get-Content -LiteralPath $executeJsonPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        } catch {
+            Write-Host "  Failed to read or parse JSON file: $_" -ForegroundColor Red
+        }
+
+        if ($executePayload -and -not ($executePayload.PSObject.Properties.Name -contains 'clusterStretchSpec')) {
+            Write-Host "  The JSON file does not contain a 'clusterStretchSpec' object. Execution cancelled." -ForegroundColor Red
+            $executePayload = $null
+        }
+
+        if ($executePayload) {
+            Write-Host ''
+            Write-Host "  This starts the stretch workflow on cluster '$($selectedCluster.name)'." -ForegroundColor Yellow
+            Write-Host '  The operation is long-running and cannot easily be undone.' -ForegroundColor Yellow
+            $confirmName = Read-Host -Prompt 'Type the cluster name to confirm execution'
+            if ($confirmName -cne $selectedCluster.name) {
+                Write-Host "  Confirmation did not match '$($selectedCluster.name)'. Execution cancelled." -ForegroundColor Yellow
+            } else {
+                Write-Host "  Submitting PATCH /v1/clusters/$($selectedCluster.id) ..." -ForegroundColor Cyan
+                try {
+                    $taskResp = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
+                        -Method PATCH -Path "/v1/clusters/$($selectedCluster.id)" -Body $executePayload
+                    Write-Host "  Stretch task submitted." -ForegroundColor Green
+                    if ($taskResp -and ($taskResp.PSObject.Properties.Name -contains 'id')) {
+                        Write-Host "  Task ID: $($taskResp.id)" -ForegroundColor Green
+                        Write-Host "  Monitor progress in the SDDC Manager UI (Tasks panel) or via:" -ForegroundColor DarkGray
+                        Write-Host "  GET https://$SDDCManagerFQDN/v1/tasks/$($taskResp.id)" -ForegroundColor DarkGray
+                    }
+                } catch {
+                    Write-Host "  Stretch request failed: $_" -ForegroundColor Red
+                }
+            }
+        }
+    } else {
+        Write-Host "  Execution skipped. The saved JSON can be submitted later." -ForegroundColor DarkGray
+    }
 }
 #endregion
 

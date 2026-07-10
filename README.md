@@ -19,7 +19,7 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 |---|---|---|
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
-| `New-VCFvSANStretchSpec.ps1` | 2.0.0 | Stretch an existing vSAN cluster across two availability zones |
+| `New-VCFvSANStretchSpec.ps1` | 2.1.0 | Stretch an existing vSAN cluster across two availability zones |
 | `New-VCFNetworkPool.ps1` | 2.7.0 | Create a network pool in SDDC Manager |
 
 ---
@@ -128,6 +128,7 @@ JSON saved as `<clusterName>-cluster-<timestamp>.json`.
 4. **Availability zone 2 host selection** — queries unassigned commissioned hosts for AZ2
 5. **Network configuration** — VDS name, uplink names, AZ2 NSX host TEP pool (CIDR, gateway, range, transport VLAN), and multi-AZ flags
 6. **Build, validate, and save** — assembles the `clusterStretchSpec` JSON payload, optionally validates via `POST /v1/clusters/{id}/validations`, saves to disk
+7. **Execute (optional)** — prompts for a stretch spec JSON file (defaults to the one just saved) and submits `PATCH /v1/clusters/{id}` after you confirm by typing the cluster name; reports the SDDC Manager task ID to monitor
 
 ### Usage
 

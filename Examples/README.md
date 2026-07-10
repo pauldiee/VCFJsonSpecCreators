@@ -14,7 +14,7 @@ Reference payloads for each script in this repository. These show the exact stru
 | `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` |
 | `workload-domain-existing-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` |
 | `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` |
-| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `POST /v1/clusters/{id}/stretch` |
+| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` |
 
 ---
 
@@ -81,14 +81,29 @@ Adds a new cluster to an existing workload domain.
 
 ## vsan-stretch.json
 
-Stretches an existing cluster across two sites by adding secondary-site hosts and a witness appliance.
+Stretches an existing vSAN cluster across two availability zones by adding second-AZ hosts, an NSX network profile (host TEP pool + uplink profile) for that zone, and a witness appliance.
+
+This is the body for the stretch operation itself: `PATCH /v1/clusters/{id}`. To validate first, wrap the same content in one more level and POST it to `/v1/clusters/{id}/validations`:
+
+```json
+{
+  "clusterUpdateSpec": {
+    "clusterStretchSpec": { ... }
+  }
+}
+```
 
 **Key values to replace:**
-- `clusterId` — UUID of the cluster to stretch; retrieve it from `GET /v1/clusters`
-- `stretchSpec.witnessSpec` — witness appliance FQDN, vSAN IP, netmask, and gateway
-- `stretchSpec.primaryFaultDomainName` / `secondaryFaultDomainName` — names for the two fault domains
-- `secondarySiteHostSpecs[].id` — host UUIDs of the secondary-site hosts
+- `hostSpecs[].id` / `hostname` — UUIDs and FQDNs of the AZ2 hosts; retrieve from `GET /v1/hosts?status=UNASSIGNED_USEABLE`
 - `vmNics[].vdsName` — must match the VDS name already in use on the existing cluster
+- `networkSpec.nsxClusterSpec.ipAddressPoolsSpec` — AZ2 host TEP pool CIDR, gateway, and range
+- `networkSpec.nsxClusterSpec.uplinkProfiles[].transportVlan` — AZ2 host TEP VLAN
+- `witnessSpec` — witness appliance FQDN, vSAN IP, and vSAN network CIDR (deploy the witness at a third site first)
+- `networkProfiles[].isDefault` — `false` for workload domain clusters (the AZ1 default profile already exists; the AZ2 profile is a sub-config); `true` when stretching the management domain default cluster, where the stretch spec defines the cluster's first VCF network profile
+- `isEdgeClusterConfiguredForMultiAZ` — set to `true` if an NSX Edge cluster runs on this vSphere cluster and is prepared for multi-AZ
+- `witnessTrafficSharedWithVsanTraffic` — set to `true` only if witness traffic shares the vSAN network
+
+**Prerequisites:** deploy and configure a vSAN witness host at a third location, create a network pool for AZ2, and commission the AZ2 hosts against it. The number of hosts in AZ2 should match AZ1.
 
 ---
 

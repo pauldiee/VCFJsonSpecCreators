@@ -19,7 +19,7 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 |---|---|---|
 | `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
-| `New-VCFvSANStretchSpec.ps1` | 1.1.0 | Stretch an existing cluster across two sites |
+| `New-VCFvSANStretchSpec.ps1` | 2.0.0 | Stretch an existing vSAN cluster across two availability zones |
 | `New-VCFNetworkPool.ps1` | 2.7.0 | Create a network pool in SDDC Manager |
 
 ---
@@ -124,10 +124,10 @@ JSON saved as `<clusterName>-cluster-<timestamp>.json`.
 
 1. **SDDC Manager connection** — authenticates and retrieves a Bearer token
 2. **Target cluster** — lists existing clusters; select the one to stretch
-3. **Witness host configuration** — FQDN, vSAN IP address, subnet mask, and gateway for the witness appliance
-4. **Secondary site host selection** — queries unassigned commissioned hosts for the secondary fault domain
-5. **Network and fault domain configuration** — VDS name, uplink names, primary and secondary fault domain names
-6. **Build, validate, and save** — assembles the JSON payload, optionally validates via `POST /v1/clusters/{id}/validations/stretch`, saves to disk
+3. **Witness host configuration** — FQDN, vSAN IP address, and vSAN network CIDR for the witness appliance
+4. **Availability zone 2 host selection** — queries unassigned commissioned hosts for AZ2
+5. **Network configuration** — VDS name, uplink names, AZ2 NSX host TEP pool (CIDR, gateway, range, transport VLAN), and multi-AZ flags
+6. **Build, validate, and save** — assembles the `clusterStretchSpec` JSON payload, optionally validates via `POST /v1/clusters/{id}/validations`, saves to disk
 
 ### Usage
 
@@ -148,7 +148,7 @@ JSON saved as `<clusterName>-cluster-<timestamp>.json`.
 ### Output
 
 ```
-POST https://<sddc-manager>/v1/clusters/{clusterId}/stretch
+PATCH https://<sddc-manager>/v1/clusters/{clusterId}
 ```
 
 JSON saved as `<clusterName>-vsan-stretch-<timestamp>.json`.
@@ -243,7 +243,7 @@ The [`Examples/`](Examples/) folder contains reference JSON payloads for each sc
 | [`workload-domain-new-nsx.json`](Examples/workload-domain-new-nsx.json) | Workload domain with a new 3-node NSX Manager |
 | [`workload-domain-existing-nsx.json`](Examples/workload-domain-existing-nsx.json) | Workload domain joining an existing NSX Manager |
 | [`cluster-spec.json`](Examples/cluster-spec.json) | New cluster added to an existing workload domain |
-| [`vsan-stretch.json`](Examples/vsan-stretch.json) | vSAN cluster stretched across two sites |
+| [`vsan-stretch.json`](Examples/vsan-stretch.json) | vSAN cluster stretched across two availability zones |
 
 See [`Examples/README.md`](Examples/README.md) for field-by-field notes on each file.
 

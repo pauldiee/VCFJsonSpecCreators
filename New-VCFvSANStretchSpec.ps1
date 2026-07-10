@@ -4,22 +4,28 @@
 
 .DESCRIPTION
     - Queries SDDC Manager for existing clusters to select the one to stretch
-    - Queries unassigned commissioned hosts for the secondary site
-    - Collects witness host, fault domain, and network configuration
-    - Builds the vSAN stretch spec JSON payload
-    - Optionally validates via SDDC Manager API (/v1/clusters/{id}/validations/stretch)
-    - Saves the JSON to disk
+    - Queries unassigned commissioned hosts for availability zone 2
+    - Collects witness host, AZ2 NSX network (host TEP pool, uplink profile), and VDS configuration
+    - Builds the clusterStretchSpec JSON payload per the VCF 9 API
+    - Optionally validates via SDDC Manager API (POST /v1/clusters/{id}/validations)
+    - Saves the JSON to disk (body for PATCH /v1/clusters/{id})
     - Supports mock mode for offline/lab testing without live SDDC Manager
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 1.1.0
+    Version : 2.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-23
+    Date    : 2026-07-10
 
     1.0.0 - Initial release
     1.1.0 - Removed ESXi license key prompt; added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
+    2.0.0 - Reworked payload to the documented VCF 9 clusterStretchSpec format:
+            hostSpecs with hostname + networkProfileName, networkSpec with AZ2 NSX
+            network profile / host TEP pool / uplink profile, witnessSpec with vsanCidr,
+            isEdgeClusterConfiguredForMultiAZ and witnessTrafficSharedWithVsanTraffic flags.
+            Removed fault domain name prompts (not part of the API spec).
+            Validation now uses POST /v1/clusters/{id}/validations; stretch via PATCH /v1/clusters/{id}.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -35,10 +41,10 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "1.1.0"
+    Version = "2.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-23"
+    Date    = "2026-07-10"
 }
 
 #endregion
@@ -54,15 +60,17 @@ $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
 # -- Witness host:
 $WitnessFQDN        = ''          # e.g. witness.vcf.lab
 $WitnessVsanIp      = ''          # e.g. 192.168.20.100 (IP on vSAN network)
-$WitnessNetmask     = ''          # e.g. 255.255.255.0
-$WitnessGateway     = ''          # e.g. 192.168.20.1
-
-# -- Fault domain names:
-$PrimaryFaultDomainName   = ''    # e.g. Preferred-Site  (leave blank to prompt)
-$SecondaryFaultDomainName = ''    # e.g. Secondary-Site  (leave blank to prompt)
+$WitnessVsanCidr    = ''          # e.g. 192.168.20.0/24 (vSAN network CIDR)
 
 # -- VDS (must match the existing cluster's VDS):
 $VDSName            = ''          # e.g. wld-01-vds01    (leave blank to prompt)
+
+# -- AZ2 NSX host TEP network:
+$Az2TepCidr         = ''          # e.g. 192.168.32.0/24
+$Az2TepGateway      = ''          # e.g. 192.168.32.1
+$Az2TepRangeStart   = ''          # e.g. 192.168.32.50
+$Az2TepRangeEnd     = ''          # e.g. 192.168.32.70
+$Az2TransportVlan   = ''          # e.g. 202 (AZ2 host TEP VLAN)
 
 $OutputJsonPath     = ''          # e.g. C:\VCF\wld-01-stretch.json (leave blank to auto-generate)
 #endregion
@@ -130,6 +138,17 @@ function Test-IPAddress {
 function Test-Password {
     param([string]$Value)
     return $Value.Length -ge 8
+}
+
+function Test-CIDR {
+    param([string]$Value)
+    if ($Value -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') { return $false }
+    return (Test-IPAddress $Matches[1]) -and ([int]$Matches[2] -ge 1) -and ([int]$Matches[2] -le 32)
+}
+
+function Test-VlanId {
+    param([string]$Value)
+    return ($Value -match '^\d+$') -and ([int]$Value -ge 0) -and ([int]$Value -le 4094)
 }
 
 function Get-OrPrompt {
@@ -313,33 +332,32 @@ Write-Host "  Target cluster: $($selectedCluster.name)  (ID: $($selectedCluster.
 Write-Host ("`n  [Step 3 of 6  --  Witness Host Configuration]") -ForegroundColor Cyan
 
 Write-Host ''
-Write-Host '  The witness host arbitrates between the two fault domains.' -ForegroundColor White
+Write-Host '  The witness host arbitrates between the two availability zones.' -ForegroundColor White
+Write-Host '  It must be deployed at a third location before stretching.' -ForegroundColor White
 Write-Host '  It can be a vSAN Witness Appliance (OVA) or a physical host.' -ForegroundColor White
 Write-Host ''
 
-$WitnessFQDN    = Get-OrPrompt -Value $WitnessFQDN -Prompt 'Witness host FQDN (e.g. witness.vcf.lab)' `
+$WitnessFQDN     = Get-OrPrompt -Value $WitnessFQDN -Prompt 'Witness host FQDN (e.g. witness.vcf.lab)' `
     -Validator { param($v) Test-FQDN $v } `
     -InvalidMessage 'Must be a valid FQDN.'
-$WitnessVsanIp  = Get-OrPrompt -Value $WitnessVsanIp -Prompt 'Witness vSAN IP address' `
+$WitnessVsanIp   = Get-OrPrompt -Value $WitnessVsanIp -Prompt 'Witness vSAN IP address' `
     -Validator { param($v) Test-IPAddress $v } `
     -InvalidMessage 'Must be a valid IPv4 address.'
-$WitnessNetmask = Get-OrPrompt -Value $WitnessNetmask -Prompt 'Witness vSAN subnet mask' `
-    -Validator { param($v) Test-IPAddress $v } `
-    -InvalidMessage 'Must be a valid subnet mask (e.g. 255.255.255.0).'
-$WitnessGateway = Get-OrPrompt -Value $WitnessGateway -Prompt 'Witness vSAN gateway' `
-    -Validator { param($v) Test-IPAddress $v } `
-    -InvalidMessage 'Must be a valid IPv4 address.'
+$WitnessVsanCidr = Get-OrPrompt -Value $WitnessVsanCidr -Prompt 'Witness vSAN network CIDR (e.g. 192.168.20.0/24)' `
+    -Validator { param($v) Test-CIDR $v } `
+    -InvalidMessage 'Must be a valid CIDR (e.g. 192.168.20.0/24).'
 
-Write-Host "  Witness: $WitnessFQDN  |  vSAN IP: $WitnessVsanIp  |  GW: $WitnessGateway" -ForegroundColor Green
+Write-Host "  Witness: $WitnessFQDN  |  vSAN IP: $WitnessVsanIp  |  CIDR: $WitnessVsanCidr" -ForegroundColor Green
 #endregion
 
 #region --- Step 4: Secondary site host selection ---
-Write-Host ("`n  [Step 4 of 6  --  Secondary Site Host Selection]") -ForegroundColor Cyan
+Write-Host ("`n  [Step 4 of 6  --  Availability Zone 2 Host Selection]") -ForegroundColor Cyan
 
 Write-Host ''
-Write-Host '  Select the hosts that will form the secondary (stretched) fault domain.' -ForegroundColor White
-Write-Host '  These must be unassigned commissioned hosts in SDDC Manager.' -ForegroundColor White
-Write-Host '  The number of secondary site hosts should match the primary site host count.' -ForegroundColor White
+Write-Host '  Select the hosts that will form availability zone 2.' -ForegroundColor White
+Write-Host '  These must be unassigned commissioned hosts in SDDC Manager,' -ForegroundColor White
+Write-Host '  commissioned against the AZ2 network pool.' -ForegroundColor White
+Write-Host '  The number of AZ2 hosts should match the AZ1 host count.' -ForegroundColor White
 Write-Host ''
 
 if ($MockMode) {
@@ -373,7 +391,7 @@ foreach ($h in $availHosts) {
 }
 
 Write-Host ''
-$selection = Read-Host -Prompt 'Enter host numbers for the secondary site (comma-separated or range, e.g. 1,2,3 or 1-3)'
+$selection = Read-Host -Prompt 'Enter host numbers for availability zone 2 (comma-separated or range, e.g. 1,2,3 or 1-3)'
 $indices = @()
 foreach ($part in ($selection -split ',')) {
     $part = $part.Trim()
@@ -397,16 +415,16 @@ foreach ($idx in $indices) {
 }
 
 if ($secondaryHosts.Count -eq 0) {
-    Write-Host "  No hosts selected for the secondary site." -ForegroundColor Red
+    Write-Host "  No hosts selected for availability zone 2." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "  $($secondaryHosts.Count) host(s) selected for secondary site:" -ForegroundColor Green
+Write-Host "  $($secondaryHosts.Count) host(s) selected for availability zone 2:" -ForegroundColor Green
 foreach ($h in $secondaryHosts) { Write-Host "    - $($h.fqdn)" }
 #endregion
 
-#region --- Step 5: Network and fault domain configuration ---
-Write-Host ("`n  [Step 5 of 6  --  Network and Fault Domain Configuration]") -ForegroundColor Cyan
+#region --- Step 5: Network configuration ---
+Write-Host ("`n  [Step 5 of 6  --  Network Configuration]") -ForegroundColor Cyan
 
 # -- VDS name --
 Write-Host ''
@@ -427,52 +445,150 @@ $uplinkNames = if ($uplinkInput -and $uplinkInput.Trim() -ne '') {
 }
 Write-Host "  Uplinks: $($uplinkNames -join ', ')" -ForegroundColor Green
 
-# -- Fault domain names --
+# -- AZ2 NSX host TEP network --
 Write-Host ''
-Write-Host '  Fault domain names identify the two sites in the stretched cluster.' -ForegroundColor White
+Write-Host '  AZ2 hosts need their own NSX network profile: a host TEP IP pool' -ForegroundColor White
+Write-Host '  and an uplink profile with the AZ2 host TEP (transport) VLAN.' -ForegroundColor White
 Write-Host ''
-$PrimaryFaultDomainName = Get-OrPrompt -Value $PrimaryFaultDomainName `
-    -Prompt 'Primary (preferred) fault domain name (e.g. Preferred-Site)' `
-    -Validator { param($v) $v.Trim().Length -ge 1 } `
-    -InvalidMessage 'Fault domain name cannot be empty.'
-$SecondaryFaultDomainName = Get-OrPrompt -Value $SecondaryFaultDomainName `
-    -Prompt 'Secondary fault domain name (e.g. Secondary-Site)' `
-    -Validator { param($v) $v.Trim().Length -ge 1 } `
-    -InvalidMessage 'Fault domain name cannot be empty.'
-Write-Host "  Fault domains — Primary: $PrimaryFaultDomainName  |  Secondary: $SecondaryFaultDomainName" -ForegroundColor Green
+$Az2TepCidr       = Get-OrPrompt -Value $Az2TepCidr -Prompt 'AZ2 host TEP pool CIDR (e.g. 192.168.32.0/24)' `
+    -Validator { param($v) Test-CIDR $v } `
+    -InvalidMessage 'Must be a valid CIDR (e.g. 192.168.32.0/24).'
+$Az2TepGateway    = Get-OrPrompt -Value $Az2TepGateway -Prompt 'AZ2 host TEP pool gateway' `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid IPv4 address.'
+$Az2TepRangeStart = Get-OrPrompt -Value $Az2TepRangeStart -Prompt 'AZ2 host TEP pool range start' `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid IPv4 address.'
+$Az2TepRangeEnd   = Get-OrPrompt -Value $Az2TepRangeEnd -Prompt 'AZ2 host TEP pool range end' `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid IPv4 address.'
+$Az2TransportVlan = Get-OrPrompt -Value $Az2TransportVlan -Prompt 'AZ2 host TEP (transport) VLAN ID' `
+    -Validator { param($v) Test-VlanId $v } `
+    -InvalidMessage 'Must be a VLAN ID between 0 and 4094.'
+Write-Host "  AZ2 TEP: $Az2TepCidr  |  GW: $Az2TepGateway  |  Range: $Az2TepRangeStart-$Az2TepRangeEnd  |  VLAN: $Az2TransportVlan" -ForegroundColor Green
+
+# -- Network profile scope --
+Write-Host ''
+Write-Host '  Management domain default cluster (bring-up): the stretch spec defines the' -ForegroundColor White
+Write-Host '  cluster''s first VCF network profile -> global config (answer y).' -ForegroundColor White
+Write-Host '  Workload domain cluster: the default profile already exists -> the AZ2' -ForegroundColor White
+Write-Host '  profile is a sub-config (answer n).' -ForegroundColor White
+$defaultProfileChoice = ''
+while ($defaultProfileChoice -notin @('y', 'n')) {
+    $defaultProfileChoice = (Read-Host -Prompt 'Is this the cluster''s first VCF network profile? (y = management domain, n = workload domain)').ToLower()
+    if ($defaultProfileChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
+}
+$isDefaultNetworkProfile = ($defaultProfileChoice -eq 'y')
+Write-Host "  Network profile isDefault: $isDefaultNetworkProfile" -ForegroundColor Green
+
+# -- Multi-AZ flags --
+Write-Host ''
+$edgeChoice = ''
+while ($edgeChoice -notin @('y', 'n')) {
+    $edgeChoice = (Read-Host -Prompt 'Does an NSX Edge cluster run on this vSphere cluster, prepared for multi-AZ? (y/n)').ToLower()
+    if ($edgeChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
+}
+$isEdgeClusterConfiguredForMultiAZ = ($edgeChoice -eq 'y')
+
+$witnessSharedChoice = ''
+while ($witnessSharedChoice -notin @('y', 'n')) {
+    $witnessSharedChoice = (Read-Host -Prompt 'Does witness traffic share the vSAN network? (y/n, usually n)').ToLower()
+    if ($witnessSharedChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
+}
+$witnessTrafficSharedWithVsanTraffic = ($witnessSharedChoice -eq 'y')
+
+Write-Host ("  Edge multi-AZ: {0}  |  Witness traffic shared with vSAN: {1}" -f `
+    $isEdgeClusterConfiguredForMultiAZ, $witnessTrafficSharedWithVsanTraffic) -ForegroundColor Green
 
 #endregion
 
 #region --- Step 6: Build JSON payload ---
 Write-Host ("`n  [Step 6 of 6  --  Building JSON Payload]") -ForegroundColor Cyan
 
-# -- Secondary site host specs --
-$secondaryHostSpecs = @()
+# -- Generated AZ2 NSX object names --
+$networkProfileName = "$($selectedCluster.name)-az2-network-profile01"
+$tepPoolName        = "$($selectedCluster.name)-az2-tep-pool"
+$uplinkProfileName  = "$($selectedCluster.name)-az2-uplink-profile01"
+$nsxUplinkNames     = for ($j = 1; $j -le $uplinkNames.Count; $j++) { "uplink-$j" }
+
+# -- AZ2 host specs --
+$az2HostSpecs = @()
 foreach ($h in $secondaryHosts) {
     $nicIds = @('vmnic0', 'vmnic1')
     $vmNics = for ($j = 0; $j -lt $nicIds.Count; $j++) {
         @{ id = $nicIds[$j]; vdsName = $vdsName; uplink = $uplinkNames[$j % $uplinkNames.Count] }
     }
-    $secondaryHostSpecs += @{
+    $az2HostSpecs += @{
         id              = $h.id
-        hostNetworkSpec = @{ vmNics = $vmNics }
+        hostname        = $h.fqdn
+        hostNetworkSpec = @{
+            networkProfileName = $networkProfileName
+            vmNics             = $vmNics
+        }
     }
 }
 
-# -- Full payload --
+# -- Full payload (body for PATCH /v1/clusters/{id}) --
 $payload = @{
-    clusterId                = $selectedCluster.id
-    deployWithoutLicenseKeys = $true
-    stretchSpec              = @{
-        primaryFaultDomainName   = $PrimaryFaultDomainName
-        secondaryFaultDomainName = $SecondaryFaultDomainName
-        witnessSpec              = @{
-            fqdn        = $WitnessFQDN
-            vsanIp      = $WitnessVsanIp
-            vsanNetmask = $WitnessNetmask
-            vsanGateway = $WitnessGateway
+    clusterStretchSpec = @{
+        deployWithoutLicenseKeys            = $true
+        hostSpecs                           = $az2HostSpecs
+        isEdgeClusterConfiguredForMultiAZ   = $isEdgeClusterConfiguredForMultiAZ
+        networkSpec                         = @{
+            networkProfiles = @(
+                @{
+                    isDefault             = $isDefaultNetworkProfile
+                    name                  = $networkProfileName
+                    nsxtHostSwitchConfigs = @(
+                        @{
+                            ipAddressPoolName    = $tepPoolName
+                            uplinkProfileName    = $uplinkProfileName
+                            vdsName              = $vdsName
+                            vdsUplinkToNsxUplink = for ($j = 0; $j -lt $uplinkNames.Count; $j++) {
+                                @{ nsxUplinkName = $nsxUplinkNames[$j]; vdsUplinkName = $uplinkNames[$j] }
+                            }
+                        }
+                    )
+                }
+            )
+            nsxClusterSpec  = @{
+                ipAddressPoolsSpec = @(
+                    @{
+                        name        = $tepPoolName
+                        description = "AZ2 host TEP pool"
+                        subnets     = @(
+                            @{
+                                cidr                = $Az2TepCidr
+                                gateway             = $Az2TepGateway
+                                ipAddressPoolRanges = @(
+                                    @{ start = $Az2TepRangeStart; end = $Az2TepRangeEnd }
+                                )
+                            }
+                        )
+                    }
+                )
+                uplinkProfiles     = @(
+                    @{
+                        name          = $uplinkProfileName
+                        transportVlan = [int]$Az2TransportVlan
+                        teamings      = @(
+                            @{
+                                name           = 'DEFAULT'
+                                policy         = 'LOADBALANCE_SRCID'
+                                activeUplinks  = @($nsxUplinkNames)
+                                standByUplinks = @()
+                            }
+                        )
+                    }
+                )
+            }
         }
-        secondarySiteHostSpecs   = $secondaryHostSpecs
+        witnessSpec                         = @{
+            fqdn     = $WitnessFQDN
+            vsanIp   = $WitnessVsanIp
+            vsanCidr = $WitnessVsanCidr
+        }
+        witnessTrafficSharedWithVsanTraffic = $witnessTrafficSharedWithVsanTraffic
     }
 }
 
@@ -495,11 +611,12 @@ if ($MockMode) {
     }
 
     if ($validateChoice -eq 'y') {
-        Write-Host "  Submitting validation request to /v1/clusters/$($selectedCluster.id)/validations/stretch ..." -ForegroundColor Cyan
+        Write-Host "  Submitting validation request to /v1/clusters/$($selectedCluster.id)/validations ..." -ForegroundColor Cyan
+        $validationBody = @{ clusterUpdateSpec = @{ clusterStretchSpec = $payload.clusterStretchSpec } }
         $validationResp = $null
         try {
             $validationResp = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
-                -Method POST -Path "/v1/clusters/$($selectedCluster.id)/validations/stretch" -Body $payload.stretchSpec
+                -Method POST -Path "/v1/clusters/$($selectedCluster.id)/validations" -Body $validationBody
         } catch {
             Write-Host "  Validation request failed: $_" -ForegroundColor Red
         }
@@ -520,7 +637,7 @@ if ($MockMode) {
                 $elapsed += $interval
                 try {
                     $poll        = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
-                        -Path "/v1/clusters/$($selectedCluster.id)/validations/stretch/$validationId"
+                        -Path "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
                     $finalStatus = $poll.executionStatus
                     Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
                     if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
@@ -585,8 +702,8 @@ try {
 #endregion
 
 Write-Host ''
-Write-Host '  To apply the stretch operation, POST the stretchSpec to:' -ForegroundColor DarkGray
-Write-Host "  POST https://$SDDCManagerFQDN/v1/clusters/$($selectedCluster.id)/stretch" -ForegroundColor DarkGray
+Write-Host '  To apply the stretch operation, PATCH the saved JSON to:' -ForegroundColor DarkGray
+Write-Host "  PATCH https://$SDDCManagerFQDN/v1/clusters/$($selectedCluster.id)" -ForegroundColor DarkGray
 Write-Host ''
 if ($MockMode) {
     Write-Host '  Done. (mock mode - no changes were made to SDDC Manager)' -ForegroundColor DarkYellow

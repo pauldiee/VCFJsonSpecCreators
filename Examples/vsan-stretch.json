@@ -1,19 +1,12 @@
 {
-  "clusterId": "<cluster-uuid>",
-  "deployWithoutLicenseKeys": true,
-  "stretchSpec": {
-    "primaryFaultDomainName": "Preferred-Site",
-    "secondaryFaultDomainName": "Secondary-Site",
-    "witnessSpec": {
-      "fqdn": "witness.vcf.lab",
-      "vsanIp": "192.168.20.100",
-      "vsanNetmask": "255.255.255.0",
-      "vsanGateway": "192.168.20.1"
-    },
-    "secondarySiteHostSpecs": [
+  "clusterStretchSpec": {
+    "deployWithoutLicenseKeys": true,
+    "hostSpecs": [
       {
         "id": "iiiiiiii-0009-0009-0009-iiiiiiiiiiii",
+        "hostname": "esxi-sec-01.vcf.lab",
         "hostNetworkSpec": {
+          "networkProfileName": "wld-cl-01-az2-network-profile01",
           "vmNics": [
             { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
             { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
@@ -22,7 +15,9 @@
       },
       {
         "id": "jjjjjjjj-0010-0010-0010-jjjjjjjjjjjj",
+        "hostname": "esxi-sec-02.vcf.lab",
         "hostNetworkSpec": {
+          "networkProfileName": "wld-cl-01-az2-network-profile01",
           "vmNics": [
             { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
             { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
@@ -31,13 +26,75 @@
       },
       {
         "id": "kkkkkkkk-0011-0011-0011-kkkkkkkkkkkk",
+        "hostname": "esxi-sec-03.vcf.lab",
         "hostNetworkSpec": {
+          "networkProfileName": "wld-cl-01-az2-network-profile01",
           "vmNics": [
             { "id": "vmnic0", "vdsName": "wld-cl-01-vds01", "uplink": "uplink1" },
             { "id": "vmnic1", "vdsName": "wld-cl-01-vds01", "uplink": "uplink2" }
           ]
         }
       }
-    ]
+    ],
+    "isEdgeClusterConfiguredForMultiAZ": false,
+    "networkSpec": {
+      "networkProfiles": [
+        {
+          "isDefault": false,
+          "name": "wld-cl-01-az2-network-profile01",
+          "nsxtHostSwitchConfigs": [
+            {
+              "ipAddressPoolName": "wld-cl-01-az2-tep-pool",
+              "uplinkProfileName": "wld-cl-01-az2-uplink-profile01",
+              "vdsName": "wld-cl-01-vds01",
+              "vdsUplinkToNsxUplink": [
+                { "nsxUplinkName": "uplink-1", "vdsUplinkName": "uplink1" },
+                { "nsxUplinkName": "uplink-2", "vdsUplinkName": "uplink2" }
+              ]
+            }
+          ]
+        }
+      ],
+      "nsxClusterSpec": {
+        "ipAddressPoolsSpec": [
+          {
+            "name": "wld-cl-01-az2-tep-pool",
+            "description": "AZ2 host TEP pool",
+            "subnets": [
+              {
+                "cidr": "192.168.32.0/24",
+                "gateway": "192.168.32.1",
+                "ipAddressPoolRanges": [
+                  {
+                    "start": "192.168.32.50",
+                    "end": "192.168.32.70"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "uplinkProfiles": [
+          {
+            "name": "wld-cl-01-az2-uplink-profile01",
+            "transportVlan": 202,
+            "teamings": [
+              {
+                "name": "DEFAULT",
+                "policy": "LOADBALANCE_SRCID",
+                "activeUplinks": [ "uplink-1", "uplink-2" ],
+                "standByUplinks": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "witnessSpec": {
+      "fqdn": "witness.vcf.lab",
+      "vsanIp": "192.168.20.100",
+      "vsanCidr": "192.168.20.0/24"
+    },
+    "witnessTrafficSharedWithVsanTraffic": false
   }
 }

@@ -1,21 +1,22 @@
 <#
 .SYNOPSIS
-    Creates a VCF 9 Workload Domain JSON, validates it against SDDC Manager, and saves it to file.
+    Creates a VCF 9.1 Workload Domain JSON, validates it against SDDC Manager, and saves it to file.
 
 .DESCRIPTION
     - Queries SDDC Manager for unassigned commissioned hosts
-    - Collects domain, vCenter, NSX, vSAN, and network pool configuration
-    - Builds the workload domain JSON payload
-    - Validates via SDDC Manager API (/v1/domains/validations)
+    - Queries SDDC Manager for cluster images (personalities) - mandatory for vCenter 9.0+
+    - Collects domain, SSO, vCenter, NSX, vSAN and network configuration
+    - Builds the VCF 9.1 DomainCreationSpec payload
+    - Validates via SDDC Manager API (POST /v1/domains/validations)
     - Saves the JSON to disk
-    - Supports mock mode for offline/lab testing without live SDDC Manager
+    - Supports mock mode for offline testing without a live SDDC Manager
 
 .NOTES
     Script  : New-VCFWorkloadDomain.ps1
-    Version : 1.6.0
+    Version : 2.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
-    Date    : 2026-03-23
+    Date    : 2026-07-14
 
     Changelog:
         1.0.0 - Initial release
@@ -26,6 +27,33 @@
         1.4.0 - Added Step 5 for VDS / network configuration: vCenter IP/gateway/subnet/size, VDS name/MTU, port-group VLAN IDs, activeUplinks, configurable geneveVlanId, optional static TEP IP pool, ESXi license key
         1.5.0 - Removed ESXi and NSX license key fields (VCF 9 consumption-based licensing requires no per-component keys); fixed NSX TEP port group missing vlanId; fixed host count minimum to 3; fixed unsafe integer casting on selection prompts
         1.6.0 - Added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
+        1.7.0 - Windows PowerShell 5.1 compatibility: replaced non-ASCII dashes (the file is
+                BOM-less UTF-8, which 5.1 decodes as ANSI, corrupting the tokenizer); gated
+                -SkipCertificateCheck behind PSEdition -eq 'Core' so 5.1 falls back to the
+                TrustAll ICertificatePolicy instead of failing on an unknown parameter
+        2.0.0 - Rebuilt the payload against the real VCF 9.1 DomainCreationSpec (verified against a
+                POST /v1/domains sample body from a live 9.1 SDDC Manager). The 1.x payload was
+                VCF 5.x-shaped and would have been rejected at validation. Changes:
+                  * nsxSpec              -> nsxTSpec
+                  * networkDetails.fqdn  -> networkDetailsSpec {dnsName, ipAddress, gateway, subnetMask}
+                  * vip now carries the IP address; vipFqdn carries the FQDN (previously both got the FQDN)
+                  * nsxClusterSpec       -> nsxClusterSpec.nsxTClusterSpec (new nesting level)
+                  * geneveVlanId         -> uplinkProfiles[].transportVlan (geneveVlanId is deprecated)
+                  * clusterSpecs[].vsanSpec -> clusterSpecs[].datastoreSpec.vsanDatastoreSpec
+                  * vcenterSpec.adminPassword -> ssoDomainSpec.ssoDomainPassword
+                  * added networkSpec.networkProfiles[] + hostSpecs[].hostNetworkSpec.networkProfileName
+                  * added clusterImageId (mandatory for vCenter 9.0+, from GET /v1/personalities)
+                  * added top-level dnsServers, ntpServers, ssoDomainSpec, orgName
+                  * removed portGroupSpecs[].vlanId (not in the schema; vMotion/vSAN VLANs come
+                    from the network pool bound to the hosts at commission time)
+                  * removed the transportType 'NSX' port group ('NSX' is not a legal enum value)
+                  * removed the top-level networkPoolName (not part of DomainCreationSpec)
+                Also: a host selection that resolves to fewer than 3 hosts now exits cleanly
+                instead of crashing on an array index in the storage-type step.
+
+    Only the "deploy a new NSX Manager" path is implemented. Joining an existing NSX Manager
+    used a nsxManagerRef field that does not exist in the 9.1 schema; it has been removed rather
+    than left in place emitting a payload that cannot work.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -41,10 +69,10 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFWorkloadDomain.ps1"
-    Version = "1.6.0"
+    Version = "2.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
-    Date    = "2026-03-23"
+    Date    = "2026-07-14"
 }
 
 #endregion
@@ -57,40 +85,48 @@ $MockModeVar        = $false      # set to $true to enable mock mode without the
 
 $SDDCManagerFQDN    = ''          # e.g. sddc-manager.vcf.lab
 
+# -- Domain / org / SSO:
 $DomainName         = ''          # e.g. wld-01
+$OrgName            = ''          # e.g. rainpole   (3-20 chars)
+$SsoDomainName      = ''          # leave blank to default to vsphere.local
+
+# -- vCenter:
 $vCenterFQDN        = ''          # e.g. vcenter-wld01.vcf.lab
 $vCenterName        = ''          # e.g. vcenter-wld01
 $vCenterDatacenter  = ''          # e.g. WLD-Datacenter
 $vCenterCluster     = ''          # e.g. WLD-Cluster-01
-# -- vCenter networking (required by SDDC Manager API):
 $vCenterIP          = ''          # e.g. 192.168.10.10
 $vCenterGateway     = ''          # e.g. 192.168.10.1
 $vCenterSubnetMask  = ''          # e.g. 255.255.255.0
 $vCenterSize        = ''          # tiny, small, medium, large, xlarge
 
+# -- Infrastructure services (comma-separated):
+$DnsServers         = ''          # e.g. 192.168.10.5,192.168.10.6
+$NtpServers         = ''          # e.g. ntp1.vcf.lab,ntp2.vcf.lab
+
 # -- VDS:
 $VDSName            = ''          # leave blank to auto-generate (<DomainName>-vds01)
 $VDSMtu             = ''          # leave blank to default to 9000
-$VMotionVlanId      = ''          # e.g. 100
-$VSanVlanId         = ''          # e.g. 101
-$NSXTepVlanId       = ''          # e.g. 102  (also becomes geneveVlanId)
-# -- NSX TEP static IP pool (leave all blank to use DHCP on the TEP VLAN):
+$NSXTransportVlanId = ''          # e.g. 102  - the NSX host TEP (overlay) VLAN
+
+# NOTE: there are deliberately no vMotion / vSAN VLAN variables. In VCF 9.1 the
+# DomainCreationSpec port groups carry no vlanId - those VLANs come from the network
+# pool that the hosts were bound to when they were commissioned.
+
+# -- NSX host TEP static IP pool (leave all blank to use DHCP on the TEP VLAN):
 $NSXTepPoolCidr     = ''          # e.g. 192.168.11.0/24
 $NSXTepPoolGateway  = ''          # e.g. 192.168.11.1
 $NSXTepPoolStart    = ''          # e.g. 192.168.11.50
 $NSXTepPoolEnd      = ''          # e.g. 192.168.11.70
 
-$NetworkPoolName    = ''          # existing network pool name in SDDC Manager
+# -- NSX Manager (new deployment):
+$NSXFormFactor      = ''          # small, medium, large, xlarge (blank to prompt)
+$NSXVipFqdn         = ''          # e.g. nsx-wld01-vip.vcf.lab
+$NSXVipIp           = ''          # e.g. 192.168.10.50   <-- an IP, not an FQDN
+$NSXGateway         = ''          # e.g. 192.168.10.1
+$NSXSubnetMask      = ''          # e.g. 255.255.255.0
 
-$NSXMode            = ''          # 'new' or 'existing' (leave blank to prompt)
-# -- New NSX only:
-$NSXManagerVIP      = ''          # e.g. nsx-wld01-vip.vcf.lab
-$NSXManager1FQDN    = ''          # e.g. nsx-wld01-m1.vcf.lab
-$NSXManager2FQDN    = ''          # e.g. nsx-wld01-m2.vcf.lab (leave blank for single node)
-$NSXManager3FQDN    = ''          # e.g. nsx-wld01-m3.vcf.lab (leave blank for single node)
-$NSXAdminPassword   = ''          # leave blank to prompt securely
-$NSXAuditPassword   = ''          # leave blank to prompt securely
-$NSXRootPassword    = ''          # leave blank to prompt securely
+$ClusterImageId     = ''          # leave blank to select from GET /v1/personalities
 
 $OutputJsonPath     = ''          # e.g. C:\VCF\wld-01-domain.json (leave blank to auto-generate)
 #endregion
@@ -99,7 +135,6 @@ $OutputJsonPath     = ''          # e.g. C:\VCF\wld-01-domain.json (leave blank 
 if ($MockModeVar) { $MockMode = [switch]$true }
 
 #region --- Mock data ---
-# Stub data used when -MockMode is active. Edit to match your intended config.
 $MockHosts = @(
     [PSCustomObject]@{
         id          = 'host-mock-001'
@@ -125,24 +160,15 @@ $MockHosts = @(
     [PSCustomObject]@{
         id          = 'host-mock-004'
         fqdn        = 'esxi-04.vcf.lab'
-        storageType = 'OSA'           # intentionally OSA — select with an ESA host to test mixed-storage abort
+        storageType = 'OSA'           # intentionally OSA - select with an ESA host to test mixed-storage abort
         cpu         = [PSCustomObject]@{ cores = 16 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 131072 }
     }
 )
 
-$MockPools = @(
-    [PSCustomObject]@{ id = 'pool-mock-001'; name = 'MockPool-WLD' }
-    [PSCustomObject]@{ id = 'pool-mock-002'; name = 'MockPool-Secondary' }
-)
-
-$MockNSXInstances = @(
-    [PSCustomObject]@{
-        id                 = 'nsx-mock-001'
-        vip                = '192.168.10.50'
-        vipFqdn            = 'nsx-mgmt-vip.vcf.lab'
-        nsxtManagerVersion = '4.2.0.0'
-    }
+$MockPersonalities = @(
+    [PSCustomObject]@{ personalityId = 'image-mock-001'; personalityName = 'ESXi-9.1.0-vSAN-ESA' }
+    [PSCustomObject]@{ personalityId = 'image-mock-002'; personalityName = 'ESXi-9.1.0-base' }
 )
 #endregion
 
@@ -154,7 +180,7 @@ function Test-FQDN {
 
 function Test-SimpleName {
     param([string]$Value)
-    # Alphanumeric, hyphens, underscores — no spaces or dots (safe for VDS / port-group names)
+    # Alphanumeric, hyphens, underscores - no spaces or dots (safe for VDS / port-group names)
     return [bool]($Value -match '^[a-zA-Z0-9][a-zA-Z0-9\-_]{0,62}$')
 }
 
@@ -182,6 +208,21 @@ function Test-Cidr {
 function Test-Password {
     param([string]$Value)
     return $Value.Length -ge 8
+}
+
+function Test-HostOrIpList {
+    param([string]$Value)
+    $items = @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    if ($items.Count -eq 0) { return $false }
+    foreach ($i in $items) {
+        if (-not ((Test-IPAddress $i) -or (Test-FQDN $i))) { return $false }
+    }
+    return $true
+}
+
+function ConvertTo-List {
+    param([string]$Value)
+    return @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 }
 
 function Get-OrPrompt {
@@ -220,6 +261,27 @@ function Get-OrPrompt {
     }
 }
 
+function Select-FromList {
+    param(
+        [string[]]$Options,
+        [string]$Prompt
+    )
+    $choices = 1..$Options.Count | ForEach-Object { [string]$_ }
+    $line = ''
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        $line += ("  [{0}] {1}" -f ($i + 1), $Options[$i])
+    }
+    Write-Host $line
+    $sel = ''
+    while ($sel -notin $choices) {
+        $sel = Read-Host -Prompt $Prompt
+        if ($sel -notin $choices) {
+            Write-Host ("  WARNING: Please enter a number from 1 to {0}." -f $Options.Count) -ForegroundColor Yellow
+        }
+    }
+    return $Options[[int]$sel - 1]
+}
+
 function Get-SDDCToken {
     param(
         [string]$FQDN,
@@ -230,7 +292,17 @@ function Get-SDDCToken {
         username = $Credential.UserName
         password = $Credential.GetNetworkCredential().Password
     } | ConvertTo-Json
-    $resp = Invoke-RestMethod -Uri $uri -Method POST -ContentType 'application/json' -Body $body -SkipCertificateCheck
+    $params = @{
+        Uri         = $uri
+        Method      = 'POST'
+        ContentType = 'application/json'
+        Body        = $body
+    }
+    # PS 7+ supports -SkipCertificateCheck natively. Windows PowerShell 5.1 does not
+    # have the parameter at all; there the TrustAll ICertificatePolicy installed in
+    # the SSL region below is what bypasses validation.
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
+    $resp = Invoke-RestMethod @params
     return $resp.accessToken
 }
 
@@ -245,12 +317,12 @@ function Invoke-SDDC {
     $headers = @{ Authorization = "Bearer $Token" }
     $uri     = "https://$FQDN$Path"
     $params  = @{
-        Uri                  = $uri
-        Method               = $Method
-        Headers              = $headers
-        ContentType          = 'application/json'
-        SkipCertificateCheck = $true
+        Uri         = $uri
+        Method      = $Method
+        Headers     = $headers
+        ContentType = 'application/json'
     }
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
     if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 20) }
     return Invoke-RestMethod @params
 }
@@ -261,13 +333,15 @@ if (-not $MockMode) {
     if ($PSVersionTable.PSVersion.Major -ge 7) {
         $null = [System.Net.Http.HttpClientHandler]  # preload assembly
     } else {
-        Add-Type -TypeDefinition @'
+        if (-not ([System.Management.Automation.PSTypeName]'TrustAll').Type) {
+            Add-Type -TypeDefinition @'
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAll : ICertificatePolicy {
     public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
 }
 '@
+        }
         [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
     }
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
@@ -286,22 +360,19 @@ Write-Host ("=" * $bannerWidth) -ForegroundColor DarkCyan
 Write-Host ""
 #endregion
 
-#region --- Mock mode banner ---
 if ($MockMode) {
     Write-Host "  *** MOCK MODE ACTIVE - no SDDC Manager calls will be made ***" -ForegroundColor Yellow
-    Write-Host "  Stub data is used for hosts, pools, NSX instances, and validation" -ForegroundColor DarkGray
+    Write-Host "  Stub data is used for hosts, cluster images, and validation" -ForegroundColor DarkGray
     Write-Host ""
 }
-#endregion
 
 #region --- Step 1: SDDC Manager connection ---
-Write-Host ("`n  [Step 1 of 8  --  SDDC Manager Connection]") -ForegroundColor Cyan
+Write-Host ("`n  [Step 1 of 9  --  SDDC Manager Connection]") -ForegroundColor Cyan
 
 if ($MockMode) {
     $SDDCManagerFQDN = if ($SDDCManagerFQDN -and $SDDCManagerFQDN.Trim() -ne '') { $SDDCManagerFQDN } else { 'sddc-manager.vcf.lab' }
     $token           = 'mock-token-000000'
     Write-Host "  [MOCK] Skipping authentication. SDDC Manager: $SDDCManagerFQDN" -ForegroundColor DarkYellow
-    Write-Host "  [MOCK] Token: $token" -ForegroundColor DarkYellow
 } else {
     $SDDCManagerFQDN = Get-OrPrompt -Value $SDDCManagerFQDN -Prompt 'SDDC Manager FQDN' `
         -Validator { param($v) Test-FQDN $v } `
@@ -325,7 +396,7 @@ if ($MockMode) {
 #endregion
 
 #region --- Step 2: Select unassigned hosts ---
-Write-Host ("`n  [Step 2 of 8  --  Host Selection]") -ForegroundColor Cyan
+Write-Host ("`n  [Step 2 of 9  --  Host Selection]") -ForegroundColor Cyan
 
 if ($MockMode) {
     Write-Host "  [MOCK] Using mock host list (hosts 1-3 = ESA, host 4 = OSA for mixed-storage abort test)." -ForegroundColor DarkYellow
@@ -359,17 +430,16 @@ foreach ($h in $availHosts) {
 }
 
 Write-Host ''
-$selection = Read-Host -Prompt 'Enter host numbers to include (comma-separated, e.g. 1,2,3)'
+$selection = Read-Host -Prompt 'Enter host numbers to include (comma-separated, e.g. 1,2,3 or a range 1-3)'
 $indices = @()
 foreach ($part in ($selection -split ',')) {
     $part = $part.Trim()
     if ($part -match '^(\d+)-(\d+)$') {
-        # Range e.g. "1-3"
         $indices += [int]$Matches[1]..[int]$Matches[2] | ForEach-Object { $_ - 1 }
     } elseif ($part -match '^\d+$') {
         $indices += [int]$part - 1
     } else {
-        Write-Host "  Invalid selection token: '$part' — expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
+        Write-Host "  Invalid selection token: '$part' - expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
         exit 1
     }
 }
@@ -383,8 +453,11 @@ foreach ($idx in $indices) {
     $selectedHosts += $availHosts[$idx]
 }
 
+# A VCF workload domain needs at least 3 hosts. Exit here rather than carrying an
+# empty set into the storage-type step, which would crash on an array index.
 if ($selectedHosts.Count -lt 3) {
-    Write-Host "  WARNING: At least 3 hosts are required for a VCF workload domain." -ForegroundColor Yellow
+    Write-Host "  At least 3 hosts are required for a VCF workload domain (got $($selectedHosts.Count))." -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "  $($selectedHosts.Count) host(s) selected:" -ForegroundColor Green
@@ -392,7 +465,7 @@ foreach ($h in $selectedHosts) { Write-Host "    - $($h.fqdn)" }
 #endregion
 
 #region --- Step 3: Detect storage type ---
-Write-Host ("`n  [Step 3 of 8  --  Storage Type Detection]") -ForegroundColor Cyan
+Write-Host ("`n  [Step 3 of 9  --  Storage Type Detection]") -ForegroundColor Cyan
 
 $storageTypes = @($selectedHosts | Select-Object -ExpandProperty storageType -Unique)
 if ($storageTypes.Count -gt 1) {
@@ -405,12 +478,22 @@ $storageType = $storageTypes[0]
 Write-Host "  Storage type: $storageType" -ForegroundColor Green
 #endregion
 
-#region --- Step 4: Domain / vCenter configuration ---
-Write-Host ("`n  [Step 4 of 8  --  Domain and vCenter Configuration]") -ForegroundColor Cyan
+#region --- Step 4: Domain / SSO / vCenter configuration ---
+Write-Host ("`n  [Step 4 of 9  --  Domain, SSO and vCenter Configuration]") -ForegroundColor Cyan
 
-$DomainName        = Get-OrPrompt -Value $DomainName        -Prompt 'Workload domain name (e.g. wld-01)' `
+$DomainName = Get-OrPrompt -Value $DomainName -Prompt 'Workload domain name (e.g. wld-01)' `
     -Validator { param($v) Test-SimpleName $v } `
     -InvalidMessage 'Domain name must start with a letter or digit and contain only letters, digits, hyphens, or underscores (no spaces or dots).'
+$OrgName = Get-OrPrompt -Value $OrgName -Prompt 'Organization name (3-20 chars, e.g. rainpole)' `
+    -Validator { param($v) $v.Length -ge 3 -and $v.Length -le 20 } `
+    -InvalidMessage 'Organization name must be 3 to 20 characters.'
+
+$ssoDomainName = if ($SsoDomainName -and $SsoDomainName.Trim() -ne '') { $SsoDomainName.Trim() } else { 'vsphere.local' }
+Write-Host "  SSO domain: $ssoDomainName" -ForegroundColor Green
+$ssoPassword = Get-OrPrompt -Value '' -Prompt "SSO password for administrator@$ssoDomainName" -Secure `
+    -Validator { param($v) Test-Password $v } `
+    -InvalidMessage 'Password must be at least 8 characters.'
+
 $vCenterFQDN       = Get-OrPrompt -Value $vCenterFQDN       -Prompt 'vCenter FQDN' `
     -Validator { param($v) Test-FQDN $v } `
     -InvalidMessage 'Must be a valid FQDN (e.g. vcenter-wld01.vcf.lab).'
@@ -420,18 +503,10 @@ $vCenterName       = Get-OrPrompt -Value $vCenterName       -Prompt 'vCenter nam
 $vCenterDatacenter = Get-OrPrompt -Value $vCenterDatacenter -Prompt 'Datacenter name'
 $vCenterCluster    = Get-OrPrompt -Value $vCenterCluster    -Prompt 'Cluster name'
 
-$vCenterRootPass  = Get-OrPrompt -Value '' -Prompt 'vCenter root password' -Secure `
+$vCenterRootPass = Get-OrPrompt -Value '' -Prompt 'vCenter root password' -Secure `
     -Validator { param($v) Test-Password $v } `
     -InvalidMessage 'Password must be at least 8 characters.'
-$vCenterAdminPass = Get-OrPrompt -Value '' -Prompt 'vCenter admin (administrator@vsphere.local) password' -Secure `
-    -Validator { param($v) Test-Password $v } `
-    -InvalidMessage 'Password must be at least 8 characters.'
-#endregion
 
-#region --- Step 5: VDS / Network configuration ---
-Write-Host ("`n  [Step 5 of 8  --  VDS and Network Configuration]") -ForegroundColor Cyan
-
-# -- vCenter networking --
 $vcenterIP = Get-OrPrompt -Value $vCenterIP -Prompt 'vCenter IP address' `
     -Validator { param($v) Test-IPAddress $v } `
     -InvalidMessage 'Must be a valid IPv4 address (e.g. 192.168.10.10).'
@@ -442,30 +517,38 @@ $vcenterSubnetMask = Get-OrPrompt -Value $vCenterSubnetMask -Prompt 'vCenter sub
     -Validator { param($v) Test-IPAddress $v } `
     -InvalidMessage 'Must be a valid subnet mask (e.g. 255.255.255.0).'
 
-# -- vCenter appliance size --
 $validVCSizes = @('tiny','small','medium','large','xlarge')
 if ($vCenterSize -and $vCenterSize.Trim().ToLower() -in $validVCSizes) {
     $vcSize = $vCenterSize.Trim().ToLower()
-    Write-Host "  vCenter size (pre-filled): $vcSize" -ForegroundColor Green
 } else {
-    if ($vCenterSize -and $vCenterSize.Trim() -ne '') {
-        Write-Host "  WARNING: Pre-filled vCenter size '$vCenterSize' is not valid. Please select." -ForegroundColor Yellow
-    }
     Write-Host ''
     Write-Host '  vCenter appliance size:' -ForegroundColor White
-    Write-Host '  [1] tiny   [2] small   [3] medium   [4] large   [5] xlarge'
-    Write-Host ''
-    $vcSizeMap = @{ '1'='tiny'; '2'='small'; '3'='medium'; '4'='large'; '5'='xlarge' }
-    $vcSizeChoice = ''
-    while ($vcSizeChoice -notin @('1','2','3','4','5')) {
-        $vcSizeChoice = Read-Host -Prompt 'Select vCenter size (1-5)'
-        if ($vcSizeChoice -notin @('1','2','3','4','5')) { Write-Host "  WARNING: Please enter a number from 1 to 5." -ForegroundColor Yellow }
-    }
-    $vcSize = $vcSizeMap[$vcSizeChoice]
+    $vcSize = Select-FromList -Options $validVCSizes -Prompt 'Select vCenter size'
 }
 Write-Host "  vCenter size: $vcSize" -ForegroundColor Green
+#endregion
 
-# -- VDS name & MTU --
+#region --- Step 5: DNS / NTP ---
+Write-Host ("`n  [Step 5 of 9  --  DNS and NTP]") -ForegroundColor Cyan
+Write-Host "  VCF 9.1 requires DNS and NTP servers on the domain spec." -ForegroundColor DarkGray
+
+$dnsInput = Get-OrPrompt -Value $DnsServers -Prompt 'DNS servers (comma-separated IPs)' `
+    -Validator { param($v) Test-HostOrIpList $v } `
+    -InvalidMessage 'Provide one or more valid IP addresses, comma-separated.'
+$dnsServerList = ConvertTo-List $dnsInput
+
+$ntpInput = Get-OrPrompt -Value $NtpServers -Prompt 'NTP servers (comma-separated IPs or FQDNs)' `
+    -Validator { param($v) Test-HostOrIpList $v } `
+    -InvalidMessage 'Provide one or more valid IPs or FQDNs, comma-separated.'
+$ntpServerList = ConvertTo-List $ntpInput
+
+Write-Host "  DNS: $($dnsServerList -join ', ')" -ForegroundColor Green
+Write-Host "  NTP: $($ntpServerList -join ', ')" -ForegroundColor Green
+#endregion
+
+#region --- Step 6: VDS and NSX overlay networking ---
+Write-Host ("`n  [Step 6 of 9  --  VDS and Overlay Networking]") -ForegroundColor Cyan
+
 $vdsName = if ($VDSName -and $VDSName.Trim() -ne '') { $VDSName.Trim() } else { "$DomainName-vds01" }
 Write-Host "  VDS name: $vdsName" -ForegroundColor Green
 
@@ -475,79 +558,67 @@ $vdsMtuInput = Get-OrPrompt -Value $VDSMtu -Prompt 'VDS MTU (press Enter for 900
 $vdsMtu = if ($vdsMtuInput -and $vdsMtuInput.Trim() -ne '') { [int]$vdsMtuInput } else { 9000 }
 Write-Host "  VDS MTU: $vdsMtu" -ForegroundColor Green
 
-# -- VDS uplinks --
 Write-Host ''
 $uplinkInput = Get-OrPrompt -Value '' -Prompt 'VDS uplink names, comma-separated (press Enter for "uplink1,uplink2")' -Optional
 $uplinkNames = if ($uplinkInput -and $uplinkInput.Trim() -ne '') {
-    @($uplinkInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    ConvertTo-List $uplinkInput
 } else {
     @('uplink1', 'uplink2')
 }
-Write-Host "  Uplinks: $($uplinkNames -join ', ')" -ForegroundColor Green
+Write-Host "  VDS uplinks: $($uplinkNames -join ', ')" -ForegroundColor Green
 
-# -- Port group VLAN IDs --
-$vMotionVlan = [int](Get-OrPrompt -Value $VMotionVlanId -Prompt 'vMotion port group VLAN ID (0-4094)' `
-    -Validator { param($v) Test-VlanId $v } `
-    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-$vsanVlan = [int](Get-OrPrompt -Value $VSanVlanId -Prompt 'vSAN port group VLAN ID (0-4094)' `
-    -Validator { param($v) Test-VlanId $v } `
-    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-$nsxTepVlan = [int](Get-OrPrompt -Value $NSXTepVlanId -Prompt 'NSX TEP (Geneve) VLAN ID (0-4094)' `
-    -Validator { param($v) Test-VlanId $v } `
-    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-Write-Host "  VLAN IDs — vMotion: $vMotionVlan  |  vSAN: $vsanVlan  |  NSX TEP: $nsxTepVlan" -ForegroundColor Green
+# NSX uplink names are a separate namespace from the vDS uplink names, and the two are
+# mapped explicitly by vdsUplinkToNsxUplink in the network profile.
+$nsxUplinkNames = @()
+for ($j = 0; $j -lt $uplinkNames.Count; $j++) { $nsxUplinkNames += ("uplink-" + ($j + 1)) }
 
-# -- NSX TEP IP pool (optional — leave blank to rely on DHCP) --
+$nsxTransportVlan = [int](Get-OrPrompt -Value $NSXTransportVlanId -Prompt 'NSX host TEP / overlay transport VLAN ID (0-4094)' `
+    -Validator { param($v) Test-VlanId $v } `
+    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
+Write-Host "  NSX transport VLAN: $nsxTransportVlan" -ForegroundColor Green
+Write-Host "  (vMotion and vSAN VLANs are taken from the hosts' network pool, not this spec.)" -ForegroundColor DarkGray
+
+# -- NSX host TEP IP pool (optional - blank means DHCP on the TEP VLAN) --
+$tepPoolName    = "$DomainName-tep-pool"
 $nsxTepPoolSpec = $null
 $allTepPoolVarsSet = ($NSXTepPoolCidr    -and $NSXTepPoolCidr.Trim()    -ne '') -and
-                    ($NSXTepPoolGateway  -and $NSXTepPoolGateway.Trim() -ne '') -and
-                    ($NSXTepPoolStart    -and $NSXTepPoolStart.Trim()   -ne '') -and
-                    ($NSXTepPoolEnd      -and $NSXTepPoolEnd.Trim()     -ne '')
+                     ($NSXTepPoolGateway -and $NSXTepPoolGateway.Trim() -ne '') -and
+                     ($NSXTepPoolStart   -and $NSXTepPoolStart.Trim()   -ne '') -and
+                     ($NSXTepPoolEnd     -and $NSXTepPoolEnd.Trim()     -ne '')
 
 if ($allTepPoolVarsSet) {
-    # Validate pre-filled values
     $tepCidr    = $NSXTepPoolCidr.Trim()
     $tepGateway = $NSXTepPoolGateway.Trim()
     $tepStart   = $NSXTepPoolStart.Trim()
     $tepEnd     = $NSXTepPoolEnd.Trim()
-    if (-not (Test-Cidr $tepCidr))        { Write-Host "  WARNING: Pre-filled NSXTepPoolCidr '$tepCidr' is invalid." -ForegroundColor Yellow;       $allTepPoolVarsSet = $false }
-    if (-not (Test-IPAddress $tepGateway)){ Write-Host "  WARNING: Pre-filled NSXTepPoolGateway '$tepGateway' is invalid." -ForegroundColor Yellow; $allTepPoolVarsSet = $false }
-    if (-not (Test-IPAddress $tepStart))  { Write-Host "  WARNING: Pre-filled NSXTepPoolStart '$tepStart' is invalid." -ForegroundColor Yellow;     $allTepPoolVarsSet = $false }
-    if (-not (Test-IPAddress $tepEnd))    { Write-Host "  WARNING: Pre-filled NSXTepPoolEnd '$tepEnd' is invalid." -ForegroundColor Yellow;         $allTepPoolVarsSet = $false }
+    if (-not (Test-Cidr $tepCidr))         { Write-Host "  WARNING: Pre-filled NSXTepPoolCidr '$tepCidr' is invalid." -ForegroundColor Yellow;       $allTepPoolVarsSet = $false }
+    if (-not (Test-IPAddress $tepGateway)) { Write-Host "  WARNING: Pre-filled NSXTepPoolGateway '$tepGateway' is invalid." -ForegroundColor Yellow; $allTepPoolVarsSet = $false }
+    if (-not (Test-IPAddress $tepStart))   { Write-Host "  WARNING: Pre-filled NSXTepPoolStart '$tepStart' is invalid." -ForegroundColor Yellow;     $allTepPoolVarsSet = $false }
+    if (-not (Test-IPAddress $tepEnd))     { Write-Host "  WARNING: Pre-filled NSXTepPoolEnd '$tepEnd' is invalid." -ForegroundColor Yellow;         $allTepPoolVarsSet = $false }
 }
 
 if (-not $allTepPoolVarsSet) {
     Write-Host ''
-    Write-Host '  NSX TEP IP addressing:' -ForegroundColor White
-    Write-Host '  [1] Use DHCP on the TEP VLAN'
-    Write-Host '  [2] Configure a static IP pool for TEP addresses'
-    Write-Host ''
-    $tepChoice = ''
-    while ($tepChoice -notin @('1', '2')) {
-        $tepChoice = Read-Host -Prompt 'Select TEP IP option (1 or 2)'
-        if ($tepChoice -notin @('1', '2')) { Write-Host "  WARNING: Please enter 1 or 2." -ForegroundColor Yellow }
-    }
-    if ($tepChoice -eq '2') {
+    Write-Host '  NSX host TEP IP addressing:' -ForegroundColor White
+    $tepChoice = Select-FromList -Options @('DHCP on the TEP VLAN', 'Static IP pool') -Prompt 'Select TEP IP option'
+    if ($tepChoice -eq 'Static IP pool') {
         $tepCidr    = Get-OrPrompt -Value '' -Prompt 'TEP IP pool CIDR (e.g. 192.168.11.0/24)' `
-            -Validator { param($v) Test-Cidr $v } `
-            -InvalidMessage 'Must be a valid CIDR (e.g. 192.168.11.0/24).'
+            -Validator { param($v) Test-Cidr $v } -InvalidMessage 'Must be a valid CIDR (e.g. 192.168.11.0/24).'
         $tepGateway = Get-OrPrompt -Value '' -Prompt 'TEP IP pool gateway' `
-            -Validator { param($v) Test-IPAddress $v } `
-            -InvalidMessage 'Must be a valid IPv4 address.'
+            -Validator { param($v) Test-IPAddress $v } -InvalidMessage 'Must be a valid IPv4 address.'
         $tepStart   = Get-OrPrompt -Value '' -Prompt 'TEP IP pool range start' `
-            -Validator { param($v) Test-IPAddress $v } `
-            -InvalidMessage 'Must be a valid IPv4 address.'
+            -Validator { param($v) Test-IPAddress $v } -InvalidMessage 'Must be a valid IPv4 address.'
         $tepEnd     = Get-OrPrompt -Value '' -Prompt 'TEP IP pool range end' `
-            -Validator { param($v) Test-IPAddress $v } `
-            -InvalidMessage 'Must be a valid IPv4 address.'
+            -Validator { param($v) Test-IPAddress $v } -InvalidMessage 'Must be a valid IPv4 address.'
         $allTepPoolVarsSet = $true
     }
 }
 
 if ($allTepPoolVarsSet) {
     $nsxTepPoolSpec = @{
-        name    = "$DomainName-tep-pool"
-        subnets = @(
+        name        = $tepPoolName
+        description = "$DomainName host TEP pool"
+        subnets     = @(
             @{
                 cidr                = $tepCidr
                 gateway             = $tepGateway
@@ -555,278 +626,270 @@ if ($allTepPoolVarsSet) {
             }
         )
     }
-    Write-Host "  TEP IP pool: $tepCidr  ($tepStart – $tepEnd, GW: $tepGateway)" -ForegroundColor Green
+    Write-Host "  TEP IP pool: $tepCidr  ($tepStart - $tepEnd, GW: $tepGateway)" -ForegroundColor Green
 } else {
-    Write-Host "  DHCP will be used for NSX TEP IP assignment." -ForegroundColor Green
+    Write-Host "  DHCP will be used for NSX host TEP IP assignment." -ForegroundColor Green
 }
-
 #endregion
 
-#region --- Step 6: NSX configuration ---
-Write-Host ("`n  [Step 6 of 8  --  NSX Configuration]") -ForegroundColor Cyan
+#region --- Step 7: NSX Manager ---
+Write-Host ("`n  [Step 7 of 9  --  NSX Manager]") -ForegroundColor Cyan
 
-if ($NSXMode -and $NSXMode.Trim() -ne '') {
-    $nsxMode = $NSXMode.Trim().ToLower()
+$validFormFactors = @('small','medium','large','xlarge')
+if ($NSXFormFactor -and $NSXFormFactor.Trim().ToLower() -in $validFormFactors) {
+    $nsxFormFactor = $NSXFormFactor.Trim().ToLower()
 } else {
     Write-Host ''
-    Write-Host '  NSX deployment options:' -ForegroundColor White
-    Write-Host '  [1] Deploy new NSX Manager'
-    Write-Host '  [2] Join existing NSX Manager'
-    Write-Host ''
-    $nsxModeChoice = ''
-    while ($nsxModeChoice -notin @('1', '2')) {
-        $nsxModeChoice = Read-Host -Prompt 'Select NSX option (1 or 2)'
-        if ($nsxModeChoice -notin @('1', '2')) { Write-Host "  WARNING: Please enter 1 or 2." -ForegroundColor Yellow }
-    }
-    $nsxMode = if ($nsxModeChoice -eq '1') { 'new' } else { 'existing' }
+    Write-Host '  NSX Manager form factor:' -ForegroundColor White
+    $nsxFormFactor = Select-FromList -Options $validFormFactors -Prompt 'Select NSX form factor'
+}
+Write-Host "  NSX form factor: $nsxFormFactor" -ForegroundColor Green
+
+$nsxNodeCount = 0
+while ($nsxNodeCount -notin @(1, 3)) {
+    $nsxNodeCountStr = Read-Host -Prompt 'Number of NSX Manager nodes (1 or 3)'
+    if ($nsxNodeCountStr -match '^\d+$') { $nsxNodeCount = [int]$nsxNodeCountStr }
+    if ($nsxNodeCount -notin @(1, 3)) { Write-Host "  WARNING: Please enter 1 or 3." -ForegroundColor Yellow }
 }
 
-$nsxSpec = $null
+# vipFqdn is required. vip is the VIP's IP address and is marked [Deprecated] in the 9.1
+# schema ("Can be omitted if FQDN is provided"), so it is optional here - but if it IS
+# sent it must be an IP, not the FQDN. v1.x put the FQDN in both, which is the bug this
+# rewrite fixes.
+$nsxVipFqdn = Get-OrPrompt -Value $NSXVipFqdn -Prompt 'NSX Manager VIP FQDN' `
+    -Validator { param($v) Test-FQDN $v } `
+    -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-vip.vcf.lab).'
+$nsxVipIp = Get-OrPrompt -Value $NSXVipIp -Prompt 'NSX Manager VIP IP address (deprecated in 9.1 - press Enter to omit)' -Optional `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid IPv4 address (e.g. 192.168.10.50).'
 
-if ($nsxMode -eq 'new') {
-    # -- New NSX Manager --
-    $nsxNodeCount = 0
-    while ($nsxNodeCount -notin @(1, 3)) {
-        $nsxNodeCountStr = Read-Host -Prompt 'Number of NSX Manager nodes (1 or 3)'
-        if ($nsxNodeCountStr -match '^\d+$') { $nsxNodeCount = [int]$nsxNodeCountStr }
-        if ($nsxNodeCount -notin @(1, 3)) { Write-Host "  WARNING: Please enter 1 or 3." -ForegroundColor Yellow }
-    }
+$nsxGateway = Get-OrPrompt -Value $NSXGateway -Prompt 'NSX Manager default gateway' `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid IPv4 address.'
+$nsxSubnetMask = Get-OrPrompt -Value $NSXSubnetMask -Prompt 'NSX Manager subnet mask' `
+    -Validator { param($v) Test-IPAddress $v } `
+    -InvalidMessage 'Must be a valid subnet mask (e.g. 255.255.255.0).'
 
-    $NSXManagerVIP   = Get-OrPrompt -Value $NSXManagerVIP   -Prompt 'NSX Manager VIP FQDN' `
-        -Validator { param($v) Test-FQDN $v } `
-        -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-vip.vcf.lab).'
-    $NSXManager1FQDN = Get-OrPrompt -Value $NSXManager1FQDN -Prompt 'NSX Manager node 1 FQDN' `
+$nsxManagerSpecs = @()
+for ($n = 1; $n -le $nsxNodeCount; $n++) {
+    $nodeFqdn = Get-OrPrompt -Value '' -Prompt "NSX Manager node $n FQDN" `
         -Validator { param($v) Test-FQDN $v } `
         -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-m1.vcf.lab).'
-    $nsxNodes        = @($NSXManager1FQDN)
-
-    if ($nsxNodeCount -eq 3) {
-        $NSXManager2FQDN = Get-OrPrompt -Value $NSXManager2FQDN -Prompt 'NSX Manager node 2 FQDN' `
-            -Validator { param($v) Test-FQDN $v } `
-            -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-m2.vcf.lab).'
-        $NSXManager3FQDN = Get-OrPrompt -Value $NSXManager3FQDN -Prompt 'NSX Manager node 3 FQDN' `
-            -Validator { param($v) Test-FQDN $v } `
-            -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-m3.vcf.lab).'
-        $nsxNodes += @($NSXManager2FQDN, $NSXManager3FQDN)
-    }
-
-    $NSXAdminPassword = Get-OrPrompt -Value $NSXAdminPassword -Prompt 'NSX admin password' -Secure `
-        -Validator { param($v) Test-Password $v } `
-        -InvalidMessage 'Password must be at least 8 characters.'
-    $NSXAuditPassword = Get-OrPrompt -Value $NSXAuditPassword -Prompt 'NSX audit password' -Secure `
-        -Validator { param($v) Test-Password $v } `
-        -InvalidMessage 'Password must be at least 8 characters.'
-    $NSXRootPassword  = Get-OrPrompt -Value $NSXRootPassword  -Prompt 'NSX root password'  -Secure `
-        -Validator { param($v) Test-Password $v } `
-        -InvalidMessage 'Password must be at least 8 characters.'
-    $nsxManagerSpecs = @()
-    foreach ($nodeFqdn in $nsxNodes) {
-        $nsxManagerSpecs += @{
-            name           = ($nodeFqdn -split '\.')[0]
-            networkDetails = @{ fqdn = $nodeFqdn }
+    $nodeIp = Get-OrPrompt -Value '' -Prompt "NSX Manager node $n IP address" `
+        -Validator { param($v) Test-IPAddress $v } `
+        -InvalidMessage 'Must be a valid IPv4 address.'
+    $nsxManagerSpecs += @{
+        name               = ($nodeFqdn -split '\.')[0]
+        networkDetailsSpec = @{
+            dnsName    = $nodeFqdn
+            ipAddress  = $nodeIp
+            gateway    = $nsxGateway
+            subnetMask = $nsxSubnetMask
         }
     }
+}
 
-    $nsxSpec = @{
-        nsxManagerSpecs         = $nsxManagerSpecs
-        vip                     = $NSXManagerVIP
-        vipFqdn                 = $NSXManagerVIP
-        nsxManagerAdminPassword = $NSXAdminPassword
-        nsxManagerAuditPassword = $NSXAuditPassword
-        nsxManagerRootPassword  = $NSXRootPassword
-    }
-    Write-Host "  New NSX Manager configured ($nsxNodeCount node(s), VIP: $NSXManagerVIP)." -ForegroundColor Green
+$nsxAdminPassword = Get-OrPrompt -Value '' -Prompt 'NSX admin password' -Secure `
+    -Validator { param($v) Test-Password $v } -InvalidMessage 'Password must be at least 8 characters.'
+$nsxAuditPassword = Get-OrPrompt -Value '' -Prompt 'NSX audit password' -Secure `
+    -Validator { param($v) Test-Password $v } -InvalidMessage 'Password must be at least 8 characters.'
+$nsxRootPassword  = Get-OrPrompt -Value '' -Prompt 'NSX root password' -Secure `
+    -Validator { param($v) Test-Password $v } -InvalidMessage 'Password must be at least 8 characters.'
 
+$nsxTSpec = @{
+    formFactor              = $nsxFormFactor
+    nsxManagerSpecs         = $nsxManagerSpecs
+    vipFqdn                 = $nsxVipFqdn
+    nsxManagerAdminPassword = $nsxAdminPassword
+    nsxManagerAuditPassword = $nsxAuditPassword
+    nsxManagerRootPassword  = $nsxRootPassword
+}
+if ($nsxVipIp -and $nsxVipIp.Trim() -ne '') { $nsxTSpec['vip'] = $nsxVipIp.Trim() }
+
+$vipSummary = if ($nsxVipIp -and $nsxVipIp.Trim() -ne '') { "$nsxVipFqdn ($nsxVipIp)" } else { "$nsxVipFqdn (vip omitted)" }
+Write-Host "  NSX Manager: $nsxNodeCount node(s), VIP $vipSummary" -ForegroundColor Green
+#endregion
+
+#region --- Step 8: Cluster image (personality) ---
+Write-Host ("`n  [Step 8 of 9  --  Cluster Image]") -ForegroundColor Cyan
+Write-Host "  A cluster image (personality) is mandatory for vCenter 9.0 and later." -ForegroundColor DarkGray
+
+if ($ClusterImageId -and $ClusterImageId.Trim() -ne '') {
+    $clusterImageId = $ClusterImageId.Trim()
+    Write-Host "  Cluster image (pre-filled): $clusterImageId" -ForegroundColor Green
 } else {
-    # -- Join existing NSX Manager --
     if ($MockMode) {
-        Write-Host "  [MOCK] Using mock NSX instance list." -ForegroundColor DarkYellow
-        $nsxList = $MockNSXInstances
+        Write-Host "  [MOCK] Using mock cluster image list." -ForegroundColor DarkYellow
+        $personalities = $MockPersonalities
     } else {
-        Write-Host "  Querying existing NSX Manager instances from SDDC Manager ..." -ForegroundColor Cyan
+        Write-Host "  Querying cluster images ..." -ForegroundColor Cyan
         try {
-            $nsxInstances = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path '/v1/nsxt-clusters'
-            $nsxList      = $nsxInstances.elements
+            $resp          = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path '/v1/personalities'
+            $personalities = $resp.elements
         } catch {
-            Write-Host "  Failed to retrieve NSX instances: $_" -ForegroundColor Red
+            Write-Host "  Failed to retrieve cluster images: $_" -ForegroundColor Red
             exit 1
         }
-        if (-not $nsxList -or $nsxList.Count -eq 0) {
-            Write-Host "  No existing NSX Manager instances found in SDDC Manager." -ForegroundColor Red
+        if (-not $personalities -or $personalities.Count -eq 0) {
+            Write-Host "  No cluster images found in SDDC Manager. Import one before creating the domain." -ForegroundColor Red
             exit 1
         }
     }
 
     Write-Host ''
-    Write-Host '  Existing NSX Manager instances:' -ForegroundColor White
+    Write-Host '  Available cluster images:' -ForegroundColor White
     $i = 1
-    foreach ($nsx in $nsxList) {
-        Write-Host ("  [{0}] {1}  |  VIP: {2}  |  Version: {3}" -f `
-            $i, $nsx.vipFqdn, $nsx.vip, $nsx.nsxtManagerVersion)
+    foreach ($p in $personalities) {
+        Write-Host ("  [{0}] {1}  (ID: {2})" -f $i, $p.personalityName, $p.personalityId)
         $i++
     }
     Write-Host ''
-
-    $nsxIdxStr = Read-Host -Prompt 'Select NSX instance to join'
-    if ($nsxIdxStr -notmatch '^\d+$' -or ([int]$nsxIdxStr - 1) -lt 0 -or ([int]$nsxIdxStr - 1) -ge $nsxList.Count) {
-        Write-Host "  Invalid NSX selection." -ForegroundColor Red
+    $imgIdxStr = Read-Host -Prompt 'Select cluster image number'
+    if ($imgIdxStr -notmatch '^\d+$' -or ([int]$imgIdxStr - 1) -lt 0 -or ([int]$imgIdxStr - 1) -ge $personalities.Count) {
+        Write-Host "  Invalid cluster image selection." -ForegroundColor Red
         exit 1
     }
-    $nsxIdx = [int]$nsxIdxStr - 1
-    $selectedNSX = $nsxList[$nsxIdx]
-
-    $nsxSpec = @{
-        nsxManagerRef = @{ id = $selectedNSX.id }
-    }
-    Write-Host "  Will join existing NSX Manager: $($selectedNSX.vipFqdn) (ID: $($selectedNSX.id))." -ForegroundColor Green
+    $selectedImage  = $personalities[[int]$imgIdxStr - 1]
+    $clusterImageId = $selectedImage.personalityId
+    Write-Host "  Cluster image: $($selectedImage.personalityName) (ID: $clusterImageId)" -ForegroundColor Green
 }
 #endregion
 
-#region --- Step 7: Network pool ---
-Write-Host ("`n  [Step 7 of 8  --  Network Pool]") -ForegroundColor Cyan
+#region --- Step 9: Build the VCF 9.1 DomainCreationSpec ---
+Write-Host ("`n  [Step 9 of 9  --  Building JSON Payload]") -ForegroundColor Cyan
 
-if ($MockMode) {
-    Write-Host "  [MOCK] Using mock network pool list." -ForegroundColor DarkYellow
-    $poolList = $MockPools
-} else {
-    Write-Host "  Querying network pools ..." -ForegroundColor Cyan
-    try {
-        $pools    = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path '/v1/network-pools'
-        $poolList = $pools.elements
-    } catch {
-        Write-Host "  Failed to retrieve network pools: $_" -ForegroundColor Red
-        exit 1
-    }
-    if (-not $poolList -or $poolList.Count -eq 0) {
-        Write-Host "  No network pools found in SDDC Manager." -ForegroundColor Red
-        exit 1
+$networkProfileName = "$DomainName-network-profile01"
+$uplinkProfileName  = "$DomainName-uplink-profile01"
+
+# -- vDS uplink <-> NSX uplink map (shared by the network profile) --
+$vdsUplinkToNsxUplink = @()
+for ($j = 0; $j -lt $uplinkNames.Count; $j++) {
+    $vdsUplinkToNsxUplink += @{
+        vdsUplinkName = $uplinkNames[$j]
+        nsxUplinkName = $nsxUplinkNames[$j]
     }
 }
 
-Write-Host ''
-Write-Host '  Available network pools:' -ForegroundColor White
-$i = 1
-foreach ($p in $poolList) {
-    Write-Host "  [$i] $($p.name)  (ID: $($p.id))"
-    $i++
-}
-Write-Host ''
-
-$selectedPool = $null
-if ($NetworkPoolName -and $NetworkPoolName.Trim() -ne '') {
-    $selectedPool = $poolList | Where-Object { $_.name -eq $NetworkPoolName } | Select-Object -First 1
-    if (-not $selectedPool) {
-        Write-Host "  WARNING: Pre-filled pool name '$NetworkPoolName' not found. Please select manually." -ForegroundColor Yellow
-    }
-}
-
-if (-not $selectedPool) {
-    $poolIdxStr = Read-Host -Prompt 'Select network pool number'
-    if ($poolIdxStr -notmatch '^\d+$' -or ([int]$poolIdxStr - 1) -lt 0 -or ([int]$poolIdxStr - 1) -ge $poolList.Count) {
-        Write-Host "  Invalid pool selection." -ForegroundColor Red
-        exit 1
-    }
-    $poolIdx = [int]$poolIdxStr - 1
-    $selectedPool = $poolList[$poolIdx]
-}
-
-Write-Host "  Network pool selected: $($selectedPool.name) (ID: $($selectedPool.id))" -ForegroundColor Green
-#endregion
-
-#region --- Step 8: Build JSON payload ---
-Write-Host ("`n  [Step 8 of 8  --  Building JSON Payload]") -ForegroundColor Cyan
-
-# -- Host specs --
+# -- Host specs: map each pNIC to a vDS uplink, cycling through the uplink list --
 $hostSpecs = @()
 foreach ($h in $selectedHosts) {
-    # Map each physical NIC to an uplink, cycling through the uplink list
-    $nicIds  = @('vmnic0', 'vmnic1')
-    $vmNics  = for ($j = 0; $j -lt $nicIds.Count; $j++) {
-        @{ id = $nicIds[$j]; vdsName = $vdsName; uplink = $uplinkNames[$j % $uplinkNames.Count] }
+    $nicIds = @('vmnic0', 'vmnic1')
+    $vmNics = @()
+    for ($j = 0; $j -lt $nicIds.Count; $j++) {
+        $vmNics += @{
+            id      = $nicIds[$j]
+            vdsName = $vdsName
+            uplink  = $uplinkNames[$j % $uplinkNames.Count]
+        }
     }
     $hostSpecs += @{
         id              = $h.id
-        hostNetworkSpec = @{ vmNics = $vmNics }
+        hostName        = $h.fqdn
+        hostNetworkSpec = @{
+            networkProfileName = $networkProfileName
+            vmNics             = $vmNics
+        }
     }
 }
 
-# -- vSAN / datastore spec --
-if ($storageType -eq 'ESA') {
-    $vsanSpec = @{
-        esaConfig            = @{ enabled = $true }
-        failuresToTolerate   = 1
-        datastoreName        = "$DomainName-vSAN-DS"
-    }
-} else {
-    $vsanSpec = @{
-        failuresToTolerate   = 1
-        datastoreName        = "$DomainName-vSAN-DS"
-    }
+# -- vSAN datastore spec --
+$vsanDatastoreSpec = @{
+    datastoreName      = "$DomainName-vSAN-DS"
+    failuresToTolerate = 1
+    esaConfig          = @{ enabled = ($storageType -eq 'ESA') }
 }
 
-# -- NSX cluster spec (TEP VLAN + optional static IP pool) --
-$nsxClusterSpec = @{ geneveVlanId = $nsxTepVlan }
-if ($nsxTepPoolSpec) {
-    $nsxClusterSpec['ipAddressPoolsSpec'] = @($nsxTepPoolSpec)
+# -- NSX host switch config for the network profile --
+$nsxtHostSwitchConfig = @{
+    vdsName              = $vdsName
+    uplinkProfileName    = $uplinkProfileName
+    vdsUplinkToNsxUplink = $vdsUplinkToNsxUplink
 }
+if ($nsxTepPoolSpec) { $nsxtHostSwitchConfig['ipAddressPoolName'] = $tepPoolName }
 
-# -- Full payload --
+# -- NSX cluster spec (note the nsxTClusterSpec nesting level) --
+$nsxTClusterSpec = @{
+    uplinkProfiles = @(
+        @{
+            name          = $uplinkProfileName
+            transportVlan = $nsxTransportVlan
+            teamings      = @(
+                @{
+                    policy         = 'LOADBALANCE_SRCID'
+                    activeUplinks  = $nsxUplinkNames
+                    standByUplinks = @()
+                }
+            )
+        }
+    )
+}
+if ($nsxTepPoolSpec) { $nsxTClusterSpec['ipAddressPoolsSpec'] = @($nsxTepPoolSpec) }
+
+# -- Port groups: no vlanId (comes from the network pool) and no 'NSX' transport type --
+$portGroupSpecs = @(
+    @{
+        name          = "$DomainName-vMotion-pg"
+        transportType = 'VMOTION'
+        activeUplinks = $uplinkNames
+    }
+    @{
+        name          = "$DomainName-vSAN-pg"
+        transportType = 'VSAN'
+        activeUplinks = $uplinkNames
+    }
+)
+
 $payload = @{
-    domainName  = $DomainName
+    domainName               = $DomainName
+    orgName                  = $OrgName
+    deployWithoutLicenseKeys = $true
+    dnsServers               = $dnsServerList
+    ntpServers               = $ntpServerList
+    ssoDomainSpec = @{
+        ssoDomainName     = $ssoDomainName
+        ssoDomainPassword = $ssoPassword
+    }
     vcenterSpec = @{
         name               = $vCenterName
+        datacenterName     = $vCenterDatacenter
         networkDetailsSpec = @{
             dnsName    = $vCenterFQDN
             ipAddress  = $vcenterIP
             gateway    = $vcenterGateway
             subnetMask = $vcenterSubnetMask
         }
-        rootPassword       = $vCenterRootPass
-        adminPassword      = $vCenterAdminPass
-        datacenterName     = $vCenterDatacenter
-        vmSize             = $vcSize
+        rootPassword = $vCenterRootPass
+        vmSize       = $vcSize
     }
+    nsxTSpec    = $nsxTSpec
     computeSpec = @{
         clusterSpecs = @(
             @{
-                name        = $vCenterCluster
-                hostSpecs   = $hostSpecs
-                vsanSpec    = $vsanSpec
-                networkSpec = @{
+                name           = $vCenterCluster
+                datacenterName = $vCenterDatacenter
+                clusterImageId = $clusterImageId
+                hostSpecs      = $hostSpecs
+                datastoreSpec  = @{ vsanDatastoreSpec = $vsanDatastoreSpec }
+                networkSpec    = @{
                     vdsSpecs = @(
                         @{
                             name           = $vdsName
                             mtu            = $vdsMtu
-                            portGroupSpecs = @(
-                                @{
-                                    name          = "$DomainName-vMotion-pg"
-                                    transportType = 'VMOTION'
-                                    vlanId        = $vMotionVlan
-                                    activeUplinks = $uplinkNames
-                                }
-                                @{
-                                    name          = "$DomainName-vSAN-pg"
-                                    transportType = 'VSAN'
-                                    vlanId        = $vsanVlan
-                                    activeUplinks = $uplinkNames
-                                }
-                                @{
-                                    name          = "$DomainName-NSX-TEP-pg"
-                                    transportType = 'NSX'
-                                    vlanId        = $nsxTepVlan
-                                    activeUplinks = $uplinkNames
-                                }
-                            )
+                            portGroupSpecs = $portGroupSpecs
                         }
                     )
-                    nsxClusterSpec = $nsxClusterSpec
+                    nsxClusterSpec  = @{ nsxTClusterSpec = $nsxTClusterSpec }
+                    networkProfiles = @(
+                        @{
+                            name                 = $networkProfileName
+                            isDefault            = $true
+                            nsxtHostSwitchConfigs = @($nsxtHostSwitchConfig)
+                        }
+                    )
                 }
             }
         )
     }
-    nsxSpec                  = $nsxSpec
-    networkPoolName          = $selectedPool.name
-    deployWithoutLicenseKeys = $true
 }
 
 $jsonOutput = $payload | ConvertTo-Json -Depth 20
@@ -921,6 +984,10 @@ try {
     $utf8Bom = New-Object System.Text.UTF8Encoding $true
     [System.IO.File]::WriteAllText($OutputJsonPath, $jsonOutput, $utf8Bom)
     Write-Host "  JSON saved to: $OutputJsonPath" -ForegroundColor Green
+    Write-Host ''
+    Write-Host "  WARNING: this file contains CLEARTEXT passwords (vCenter root, SSO, NSX" -ForegroundColor Yellow
+    Write-Host "  admin/audit/root). Treat it as customer data: keep it out of git, out of" -ForegroundColor Yellow
+    Write-Host "  tickets and chat, and delete it once the domain is deployed." -ForegroundColor Yellow
 } catch {
     Write-Host "  Failed to save JSON: $_" -ForegroundColor Red
 }

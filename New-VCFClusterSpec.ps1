@@ -13,7 +13,7 @@
 
 .NOTES
     Script  : New-VCFClusterSpec.ps1
-    Version : 1.1.0
+    Version : 2.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-23
@@ -21,6 +21,27 @@
     Changelog:
         1.0.0 - Initial release
         1.1.0 - Removed ESXi license key prompt; added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
+        1.2.0 - Windows PowerShell 5.1 compatibility: replaced non-ASCII dashes (the file is
+                BOM-less UTF-8, which 5.1 decodes as ANSI, corrupting the tokenizer); gated
+                -SkipCertificateCheck behind PSEdition -eq 'Core' so 5.1 falls back to the
+                TrustAll ICertificatePolicy instead of failing on an unknown parameter
+        2.0.0 - Rebuilt the payload against the real VCF 9.1 cluster spec (verified against a
+                POST /v1/clusters sample body from a live 9.1 SDDC Manager). The 1.x payload was
+                VCF 5.x-shaped and would have been rejected at validation. The cluster body's
+                computeSpec.clusterSpecs[] is identical in shape to the one inside
+                DomainCreationSpec, so these are the same corrections made in
+                New-VCFWorkloadDomain.ps1 v2.0.0:
+                  * clusterSpecs[].vsanSpec -> clusterSpecs[].datastoreSpec.vsanDatastoreSpec
+                  * nsxClusterSpec          -> nsxClusterSpec.nsxTClusterSpec (new nesting level)
+                  * geneveVlanId            -> uplinkProfiles[].transportVlan (geneveVlanId is deprecated)
+                  * added networkSpec.networkProfiles[] + hostSpecs[].hostNetworkSpec.networkProfileName
+                  * added hostSpecs[].hostName
+                  * added clusterImageId (mandatory for vCenter 9.0+, from GET /v1/personalities)
+                  * added top-level dnsServers and ntpServers
+                  * removed portGroupSpecs[].vlanId (not in the schema; vMotion/vSAN VLANs come
+                    from the network pool bound to the hosts at commission time)
+                  * removed the transportType 'NSX' port group ('NSX' is not a legal enum value)
+                  * removed the top-level networkPoolName (not part of the cluster spec)
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -36,7 +57,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFClusterSpec.ps1"
-    Version = "1.1.0"
+    Version = "2.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-23"
@@ -57,10 +78,13 @@ $ClusterName        = ''          # e.g. wld-cl-02
 # -- VDS:
 $VDSName            = ''          # leave blank to auto-generate (<ClusterName>-vds01)
 $VDSMtu             = ''          # leave blank to default to 9000
-$VMotionVlanId      = ''          # e.g. 100
-$VSanVlanId         = ''          # e.g. 101
-$NSXTepVlanId       = ''          # e.g. 102  (also becomes geneveVlanId)
-# -- NSX TEP static IP pool (leave all blank to use DHCP on the TEP VLAN):
+$NSXTepVlanId       = ''          # e.g. 102  - the NSX host TEP (overlay) transport VLAN
+
+# NOTE: there are deliberately no vMotion / vSAN VLAN variables. In VCF 9.1 the cluster
+# spec's port groups carry no vlanId - those VLANs come from the network pool that the
+# hosts were bound to when they were commissioned.
+
+# -- NSX host TEP static IP pool (leave all blank to use DHCP on the TEP VLAN):
 $NSXTepPoolCidr     = ''          # e.g. 192.168.11.0/24
 $NSXTepPoolGateway  = ''          # e.g. 192.168.11.1
 $NSXTepPoolStart    = ''          # e.g. 192.168.11.50
@@ -70,7 +94,11 @@ $NSXTepPoolEnd      = ''          # e.g. 192.168.11.70
 $VSanDatastoreName  = ''          # leave blank to auto-generate (<ClusterName>-vSAN-DS)
 $FailuresToTolerate = ''          # 1 or 2 (leave blank to prompt)
 
-$NetworkPoolName    = ''          # existing network pool name in SDDC Manager
+# -- Infrastructure services (comma-separated):
+$DnsServers         = ''          # e.g. 192.168.10.5,192.168.10.6
+$NtpServers         = ''          # e.g. ntp1.vcf.lab,ntp2.vcf.lab
+
+$ClusterImageId     = ''          # leave blank to select from GET /v1/personalities
 
 $OutputJsonPath     = ''          # e.g. C:\VCF\wld-cl-02.json (leave blank to auto-generate)
 #endregion
@@ -110,15 +138,15 @@ $MockHosts = @(
     [PSCustomObject]@{
         id          = 'host-mock-004'
         fqdn        = 'esxi-04.vcf.lab'
-        storageType = 'OSA'           # intentionally OSA — select with an ESA host to test mixed-storage abort
+        storageType = 'OSA'           # intentionally OSA - select with an ESA host to test mixed-storage abort
         cpu         = [PSCustomObject]@{ cores = 16 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 131072 }
     }
 )
 
-$MockPools = @(
-    [PSCustomObject]@{ id = 'pool-mock-001'; name = 'MockPool-WLD' }
-    [PSCustomObject]@{ id = 'pool-mock-002'; name = 'MockPool-Secondary' }
+$MockPersonalities = @(
+    [PSCustomObject]@{ personalityId = 'image-mock-001'; personalityName = 'ESXi-9.1.0-vSAN-ESA' }
+    [PSCustomObject]@{ personalityId = 'image-mock-002'; personalityName = 'ESXi-9.1.0-base' }
 )
 #endregion
 
@@ -126,6 +154,21 @@ $MockPools = @(
 function Test-FQDN {
     param([string]$Value)
     return [bool]($Value -match '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$')
+}
+
+function Test-HostOrIpList {
+    param([string]$Value)
+    $items = @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    if ($items.Count -eq 0) { return $false }
+    foreach ($i in $items) {
+        if (-not ((Test-IPAddress $i) -or (Test-FQDN $i))) { return $false }
+    }
+    return $true
+}
+
+function ConvertTo-List {
+    param([string]$Value)
+    return @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 }
 
 function Test-SimpleName {
@@ -203,7 +246,17 @@ function Get-SDDCToken {
         username = $Credential.UserName
         password = $Credential.GetNetworkCredential().Password
     } | ConvertTo-Json
-    $resp = Invoke-RestMethod -Uri $uri -Method POST -ContentType 'application/json' -Body $body -SkipCertificateCheck
+    $params = @{
+        Uri         = $uri
+        Method      = 'POST'
+        ContentType = 'application/json'
+        Body        = $body
+    }
+    # PS 7+ supports -SkipCertificateCheck natively. Windows PowerShell 5.1 does not
+    # have the parameter at all; there the TrustAll ICertificatePolicy installed in
+    # the SSL region below is what bypasses validation.
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
+    $resp = Invoke-RestMethod @params
     return $resp.accessToken
 }
 
@@ -218,12 +271,12 @@ function Invoke-SDDC {
     $headers = @{ Authorization = "Bearer $Token" }
     $uri     = "https://$FQDN$Path"
     $params  = @{
-        Uri                  = $uri
-        Method               = $Method
-        Headers              = $headers
-        ContentType          = 'application/json'
-        SkipCertificateCheck = $true
+        Uri         = $uri
+        Method      = $Method
+        Headers     = $headers
+        ContentType = 'application/json'
     }
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
     if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 20) }
     return Invoke-RestMethod @params
 }
@@ -380,7 +433,7 @@ foreach ($part in ($selection -split ',')) {
     } elseif ($part -match '^\d+$') {
         $indices += [int]$part - 1
     } else {
-        Write-Host "  Invalid selection token: '$part' — expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
+        Write-Host "  Invalid selection token: '$part' - expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
         exit 1
     }
 }
@@ -394,8 +447,14 @@ foreach ($idx in $indices) {
     $selectedHosts += $availHosts[$idx]
 }
 
-if ($selectedHosts.Count -lt 2) {
-    Write-Host "  WARNING: At least 2 hosts are recommended for a cluster." -ForegroundColor Yellow
+# Exit on an empty selection rather than carrying it into the storage-type step,
+# which would crash on an array index.
+if ($selectedHosts.Count -eq 0) {
+    Write-Host "  No hosts selected. Nothing to build." -ForegroundColor Red
+    exit 1
+}
+if ($selectedHosts.Count -lt 3) {
+    Write-Host "  WARNING: a vSAN cluster normally needs at least 3 hosts (FTT=1), or 5 for FTT=2." -ForegroundColor Yellow
 }
 
 Write-Host "  $($selectedHosts.Count) host(s) selected:" -ForegroundColor Green
@@ -482,17 +541,20 @@ $uplinkNames = if ($uplinkInput -and $uplinkInput.Trim() -ne '') {
 }
 Write-Host "  Uplinks: $($uplinkNames -join ', ')" -ForegroundColor Green
 
-# -- Port group VLAN IDs --
-$vMotionVlan = [int](Get-OrPrompt -Value $VMotionVlanId -Prompt 'vMotion port group VLAN ID (0-4094)' `
+# -- NSX uplink names: a separate namespace from the vDS uplink names, mapped
+#    explicitly by vdsUplinkToNsxUplink in the network profile. --
+$nsxUplinkNames = @()
+for ($j = 0; $j -lt $uplinkNames.Count; $j++) { $nsxUplinkNames += ("uplink-" + ($j + 1)) }
+
+# -- NSX transport (overlay) VLAN --
+# There are deliberately no vMotion / vSAN VLAN prompts: in VCF 9.1 the cluster spec's
+# port groups carry no vlanId. Those VLANs come from the network pool the hosts were
+# bound to when they were commissioned.
+$nsxTepVlan = [int](Get-OrPrompt -Value $NSXTepVlanId -Prompt 'NSX host TEP / overlay transport VLAN ID (0-4094)' `
     -Validator { param($v) Test-VlanId $v } `
     -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-$vsanVlan    = [int](Get-OrPrompt -Value $VSanVlanId    -Prompt 'vSAN port group VLAN ID (0-4094)' `
-    -Validator { param($v) Test-VlanId $v } `
-    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-$nsxTepVlan  = [int](Get-OrPrompt -Value $NSXTepVlanId  -Prompt 'NSX TEP (Geneve) VLAN ID (0-4094)' `
-    -Validator { param($v) Test-VlanId $v } `
-    -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-Write-Host "  VLAN IDs — vMotion: $vMotionVlan  |  vSAN: $vsanVlan  |  NSX TEP: $nsxTepVlan" -ForegroundColor Green
+Write-Host "  NSX transport VLAN: $nsxTepVlan" -ForegroundColor Green
+Write-Host "  (vMotion and vSAN VLANs are taken from the hosts' network pool, not this spec.)" -ForegroundColor DarkGray
 
 # -- NSX TEP IP pool (optional) --
 $nsxTepPoolSpec = $null
@@ -540,10 +602,12 @@ if (-not $allTepPoolVarsSet) {
     }
 }
 
+$tepPoolName = "$ClusterName-tep-pool"
 if ($allTepPoolVarsSet) {
     $nsxTepPoolSpec = @{
-        name    = "$ClusterName-tep-pool"
-        subnets = @(
+        name        = $tepPoolName
+        description = "$ClusterName host TEP pool"
+        subnets     = @(
             @{
                 cidr                = $tepCidr
                 gateway             = $tepGateway
@@ -551,136 +615,185 @@ if ($allTepPoolVarsSet) {
             }
         )
     }
-    Write-Host "  TEP IP pool: $tepCidr  ($tepStart – $tepEnd, GW: $tepGateway)" -ForegroundColor Green
+    Write-Host "  TEP IP pool: $tepCidr  ($tepStart - $tepEnd, GW: $tepGateway)" -ForegroundColor Green
 } else {
-    Write-Host "  DHCP will be used for NSX TEP IP assignment." -ForegroundColor Green
+    Write-Host "  DHCP will be used for NSX host TEP IP assignment." -ForegroundColor Green
 }
 
-# -- Network pool --
+# -- DNS / NTP (required on the VCF 9.1 cluster spec) --
 Write-Host ''
-if ($MockMode) {
-    Write-Host "  [MOCK] Using mock network pool list." -ForegroundColor DarkYellow
-    $poolList = $MockPools
+$dnsInput = Get-OrPrompt -Value $DnsServers -Prompt 'DNS servers (comma-separated IPs)' `
+    -Validator { param($v) Test-HostOrIpList $v } `
+    -InvalidMessage 'Provide one or more valid IP addresses, comma-separated.'
+$dnsServerList = ConvertTo-List $dnsInput
+
+$ntpInput = Get-OrPrompt -Value $NtpServers -Prompt 'NTP servers (comma-separated IPs or FQDNs)' `
+    -Validator { param($v) Test-HostOrIpList $v } `
+    -InvalidMessage 'Provide one or more valid IPs or FQDNs, comma-separated.'
+$ntpServerList = ConvertTo-List $ntpInput
+
+Write-Host "  DNS: $($dnsServerList -join ', ')" -ForegroundColor Green
+Write-Host "  NTP: $($ntpServerList -join ', ')" -ForegroundColor Green
+
+# -- Cluster image (personality) - mandatory for vCenter 9.0+ --
+Write-Host ''
+if ($ClusterImageId -and $ClusterImageId.Trim() -ne '') {
+    $clusterImageId = $ClusterImageId.Trim()
+    Write-Host "  Cluster image (pre-filled): $clusterImageId" -ForegroundColor Green
 } else {
-    Write-Host "  Querying network pools ..." -ForegroundColor Cyan
-    try {
-        $pools    = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path '/v1/network-pools'
-        $poolList = $pools.elements
-    } catch {
-        Write-Host "  Failed to retrieve network pools: $_" -ForegroundColor Red
+    if ($MockMode) {
+        Write-Host "  [MOCK] Using mock cluster image list." -ForegroundColor DarkYellow
+        $personalities = $MockPersonalities
+    } else {
+        Write-Host "  Querying cluster images ..." -ForegroundColor Cyan
+        try {
+            $resp          = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path '/v1/personalities'
+            $personalities = $resp.elements
+        } catch {
+            Write-Host "  Failed to retrieve cluster images: $_" -ForegroundColor Red
+            exit 1
+        }
+        if (-not $personalities -or $personalities.Count -eq 0) {
+            Write-Host "  No cluster images found in SDDC Manager. Import one before creating the cluster." -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    Write-Host '  Available cluster images:' -ForegroundColor White
+    $i = 1
+    foreach ($p in $personalities) {
+        Write-Host ("  [{0}] {1}  (ID: {2})" -f $i, $p.personalityName, $p.personalityId)
+        $i++
+    }
+    Write-Host ''
+    $imgIdxStr = Read-Host -Prompt 'Select cluster image number'
+    if ($imgIdxStr -notmatch '^\d+$' -or ([int]$imgIdxStr - 1) -lt 0 -or ([int]$imgIdxStr - 1) -ge $personalities.Count) {
+        Write-Host "  Invalid cluster image selection." -ForegroundColor Red
         exit 1
     }
-    if (-not $poolList -or $poolList.Count -eq 0) {
-        Write-Host "  No network pools found in SDDC Manager." -ForegroundColor Red
-        exit 1
-    }
+    $selectedImage  = $personalities[[int]$imgIdxStr - 1]
+    $clusterImageId = $selectedImage.personalityId
+    Write-Host "  Cluster image: $($selectedImage.personalityName) (ID: $clusterImageId)" -ForegroundColor Green
 }
-
-Write-Host '  Available network pools:' -ForegroundColor White
-$i = 1
-foreach ($p in $poolList) {
-    Write-Host "  [$i] $($p.name)  (ID: $($p.id))"
-    $i++
-}
-Write-Host ''
-
-$selectedPool = $null
-if ($NetworkPoolName -and $NetworkPoolName.Trim() -ne '') {
-    $selectedPool = $poolList | Where-Object { $_.name -eq $NetworkPoolName } | Select-Object -First 1
-    if (-not $selectedPool) {
-        Write-Host "  WARNING: Pre-filled pool name '$NetworkPoolName' not found. Please select manually." -ForegroundColor Yellow
-    }
-}
-
-if (-not $selectedPool) {
-    $poolIdx = [int](Read-Host -Prompt 'Select network pool number') - 1
-    if ($poolIdx -lt 0 -or $poolIdx -ge $poolList.Count) {
-        Write-Host "  Invalid pool selection." -ForegroundColor Red
-        exit 1
-    }
-    $selectedPool = $poolList[$poolIdx]
-}
-Write-Host "  Network pool selected: $($selectedPool.name)  (ID: $($selectedPool.id))" -ForegroundColor Green
 #endregion
 
 #region --- Step 7: Build JSON payload ---
 Write-Host ("`n  [Step 7 of 7  --  Building JSON Payload]") -ForegroundColor Cyan
 
+$networkProfileName = "$ClusterName-network-profile01"
+$uplinkProfileName  = "$ClusterName-uplink-profile01"
+
+# -- vDS uplink <-> NSX uplink map (shared by the network profile) --
+$vdsUplinkToNsxUplink = @()
+for ($j = 0; $j -lt $uplinkNames.Count; $j++) {
+    $vdsUplinkToNsxUplink += @{
+        vdsUplinkName = $uplinkNames[$j]
+        nsxUplinkName = $nsxUplinkNames[$j]
+    }
+}
+
 # -- Host specs --
 $hostSpecs = @()
 foreach ($h in $selectedHosts) {
     $nicIds = @('vmnic0', 'vmnic1')
-    $vmNics = for ($j = 0; $j -lt $nicIds.Count; $j++) {
-        @{ id = $nicIds[$j]; vdsName = $vdsName; uplink = $uplinkNames[$j % $uplinkNames.Count] }
+    $vmNics = @()
+    for ($j = 0; $j -lt $nicIds.Count; $j++) {
+        $vmNics += @{
+            id      = $nicIds[$j]
+            vdsName = $vdsName
+            uplink  = $uplinkNames[$j % $uplinkNames.Count]
+        }
     }
     $hostSpecs += @{
         id              = $h.id
-        hostNetworkSpec = @{ vmNics = $vmNics }
+        hostName        = $h.fqdn
+        hostNetworkSpec = @{
+            networkProfileName = $networkProfileName
+            vmNics             = $vmNics
+        }
     }
 }
 
-# -- vSAN spec --
-if ($storageType -eq 'ESA') {
-    $vsanSpec = @{
-        esaConfig          = @{ enabled = $true }
-        failuresToTolerate = $fttResolved
-        datastoreName      = $vsanDatastoreName
-    }
-} else {
-    $vsanSpec = @{
-        failuresToTolerate = $fttResolved
-        datastoreName      = $vsanDatastoreName
-    }
+# -- vSAN datastore spec --
+$vsanDatastoreSpec = @{
+    datastoreName      = $vsanDatastoreName
+    failuresToTolerate = $fttResolved
+    esaConfig          = @{ enabled = ($storageType -eq 'ESA') }
 }
 
-# -- NSX cluster spec (TEP VLAN + optional static IP pool) --
-$nsxClusterSpec = @{ geneveVlanId = $nsxTepVlan }
-if ($nsxTepPoolSpec) {
-    $nsxClusterSpec['ipAddressPoolsSpec'] = @($nsxTepPoolSpec)
+# -- NSX host switch config for the network profile --
+$nsxtHostSwitchConfig = @{
+    vdsName              = $vdsName
+    uplinkProfileName    = $uplinkProfileName
+    vdsUplinkToNsxUplink = $vdsUplinkToNsxUplink
 }
+if ($nsxTepPoolSpec) { $nsxtHostSwitchConfig['ipAddressPoolName'] = $tepPoolName }
+
+# -- NSX cluster spec (note the nsxTClusterSpec nesting level) --
+$nsxTClusterSpec = @{
+    uplinkProfiles = @(
+        @{
+            name          = $uplinkProfileName
+            transportVlan = $nsxTepVlan
+            teamings      = @(
+                @{
+                    policy         = 'LOADBALANCE_SRCID'
+                    activeUplinks  = $nsxUplinkNames
+                    standByUplinks = @()
+                }
+            )
+        }
+    )
+}
+if ($nsxTepPoolSpec) { $nsxTClusterSpec['ipAddressPoolsSpec'] = @($nsxTepPoolSpec) }
+
+# -- Port groups: no vlanId (comes from the network pool) and no 'NSX' transport type --
+$portGroupSpecs = @(
+    @{
+        name          = "$ClusterName-vMotion-pg"
+        transportType = 'VMOTION'
+        activeUplinks = $uplinkNames
+    }
+    @{
+        name          = "$ClusterName-vSAN-pg"
+        transportType = 'VSAN'
+        activeUplinks = $uplinkNames
+    }
+)
 
 # -- Full payload --
 $payload = @{
-    domainId    = $selectedDomain.id
+    domainId                 = $selectedDomain.id
+    deployWithoutLicenseKeys = $true
+    dnsServers               = $dnsServerList
+    ntpServers               = $ntpServerList
     computeSpec = @{
         clusterSpecs = @(
             @{
-                name        = $ClusterName
-                hostSpecs   = $hostSpecs
-                vsanSpec    = $vsanSpec
-                networkSpec = @{
+                name           = $ClusterName
+                clusterImageId = $clusterImageId
+                hostSpecs      = $hostSpecs
+                datastoreSpec  = @{ vsanDatastoreSpec = $vsanDatastoreSpec }
+                networkSpec    = @{
                     vdsSpecs = @(
                         @{
                             name           = $vdsName
                             mtu            = $vdsMtu
-                            portGroupSpecs = @(
-                                @{
-                                    name          = "$ClusterName-vMotion-pg"
-                                    transportType = 'VMOTION'
-                                    vlanId        = $vMotionVlan
-                                    activeUplinks = $uplinkNames
-                                }
-                                @{
-                                    name          = "$ClusterName-vSAN-pg"
-                                    transportType = 'VSAN'
-                                    vlanId        = $vsanVlan
-                                    activeUplinks = $uplinkNames
-                                }
-                                @{
-                                    name          = "$ClusterName-NSX-TEP-pg"
-                                    transportType = 'NSX'
-                                    activeUplinks = $uplinkNames
-                                }
-                            )
+                            portGroupSpecs = $portGroupSpecs
                         }
                     )
-                    nsxClusterSpec = $nsxClusterSpec
+                    nsxClusterSpec  = @{ nsxTClusterSpec = $nsxTClusterSpec }
+                    networkProfiles = @(
+                        @{
+                            name                  = $networkProfileName
+                            isDefault             = $true
+                            nsxtHostSwitchConfigs = @($nsxtHostSwitchConfig)
+                        }
+                    )
                 }
             }
         )
     }
-    networkPoolName          = $selectedPool.name
-    deployWithoutLicenseKeys = $true
 }
 
 $jsonOutput = $payload | ConvertTo-Json -Depth 20

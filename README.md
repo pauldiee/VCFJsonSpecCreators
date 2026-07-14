@@ -1,6 +1,13 @@
 # VCF JSON Spec Creators
 
-> **Disclaimer:** These scripts are provided as-is and have not been formally tested against a live VCF environment. Use at your own risk. Always validate the generated JSON payload via the SDDC Manager API's validation endpoints before submitting to production.
+> **Disclaimer:** These scripts are provided as-is. Use at your own risk. Always validate the generated JSON payload via the SDDC Manager API's validation endpoints before submitting to production.
+>
+> **Testing status (VCF 9.1):**
+> - `New-VCFWorkloadDomain.ps1` and `New-VCFClusterSpec.ps1` — payloads POSTed to the `/validations` endpoints of a live VCF 9.1 SDDC Manager; both clear schema validation.
+> - `New-VCFvSANStretchSpec.ps1` — **used successfully on a live management domain**; the stretch completed. The workload-domain variant differs by one flag (`networkProfiles[].isDefault` = `false` for a workload domain, `true` for the management domain) and has not been exercised end-to-end yet.
+> - `New-VCFNetworkPool.ps1` — used against a live SDDC Manager.
+>
+> Note that `clusterStretchSpec` is a different model from `DomainCreationSpec` and is legitimately shaped differently: its `nsxClusterSpec` takes `{ipAddressPoolsSpec, uplinkProfiles}` **directly** (no `nsxTClusterSpec` wrapper), and it uses lowercase `hostname`. Do not "fix" it to match the domain spec.
 
 Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 
@@ -17,10 +24,10 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 
 | Script | Version | Purpose |
 |---|---|---|
-| `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
-| `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
-| `New-VCFvSANStretchSpec.ps1` | 2.1.0 | Stretch an existing vSAN cluster across two availability zones |
-| `New-VCFNetworkPool.ps1` | 2.7.0 | Create a network pool in SDDC Manager |
+| `New-VCFWorkloadDomain.ps1` | 2.0.0 | Create a new workload domain |
+| `New-VCFClusterSpec.ps1` | 2.0.0 | Add a cluster to an existing workload domain |
+| `New-VCFvSANStretchSpec.ps1` | 2.2.0 | Stretch an existing vSAN cluster across two availability zones |
+| `New-VCFNetworkPool.ps1` | 2.8.0 | Create a network pool in SDDC Manager |
 
 ---
 

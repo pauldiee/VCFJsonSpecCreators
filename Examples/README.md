@@ -8,13 +8,15 @@ Reference payloads for each script in this repository. These show the exact stru
 
 ## Files
 
-| File | Script | API Endpoint |
-|---|---|---|
-| `network-pool.json` | `New-VCFNetworkPool.ps1` | `POST /v1/network-pools` |
-| `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` |
-| `workload-domain-existing-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` |
-| `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` |
-| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` |
+| File | Script | API Endpoint | 9.1 status |
+|---|---|---|---|
+| `network-pool.json` | `New-VCFNetworkPool.ps1` | `POST /v1/network-pools` | |
+| `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` | ✅ verified against a live 9.1 SDDC Manager |
+| `workload-domain-existing-nsx.json` | *(no script — see notes)* | `POST /v1/domains` | ⚠️ **unverified** — NSX reuse is undocumented |
+| `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` | ❗ still VCF 5.x-shaped — not yet reworked |
+| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` | aligned to the documented 9.x `clusterStretchSpec` |
+
+> **Verified** means every key path in the file was diffed against a `POST /v1/domains` sample body pulled from a live VCF 9.1 SDDC Manager, and none are unknown to the schema.
 
 ---
 
@@ -57,21 +59,48 @@ Verified field-by-field against a `POST /v1/domains` sample body taken from a li
 
 ## workload-domain-existing-nsx.json
 
-Creates a new workload domain and **joins an existing NSX Manager** instance.
+Creates a new workload domain that **joins an existing NSX Manager** instance.
 
-The only difference from the new-NSX variant is the `nsxSpec` block, which reduces to:
+> ⚠️ **UNVERIFIED against VCF 9.1 — validate before you deploy from it.**
+
+### Why this one carries a warning
+
+The VCF 9.1 `DomainCreationSpec` has **no field for referencing an existing NSX cluster**. There is no `nsxManagerRef`, no NSX cluster ID, no query parameter, and no separate endpoint. Earlier versions of this repo emitted:
 
 ```json
-"nsxSpec": {
-  "nsxManagerRef": {
-    "id": "<nsx-manager-uuid>"
-  }
-}
+"nsxSpec": { "nsxManagerRef": { "id": "<nsx-manager-uuid>" } }
 ```
 
-**Key values to replace:**
-- Same as the new-NSX variant above
-- `nsxSpec.nsxManagerRef.id` — UUID of the existing NSX Manager; retrieve it from `GET /v1/nsxt-managers`
+That is **not in the 9.1 schema** and cannot work. It has been removed.
+
+What *is* documented:
+
+- Joining an existing NSX Manager is supported. From "Create a New Workload Domain Using VCF Operations": *"Choose whether to create a new NSX Manager instance or join an existing NSX Manager instance. If you already have an NSX Manager instance for a different workload domain, you can reuse that NSX Manager instance or create a new one."*
+- The platform models shareability: `GET /v1/nsxt-clusters?isShareable=true` — *"filter NSX clusters which can be shared for domain creation"* — and the response carries `isShared` / `isShareable`. The `Domain` model has `isPrimaryDomainForNsx`.
+- Broadcom KB 401167 tells you to fall back to a `DomainCreationSpec` JSON when the UI's "Join Existing NSX Manager" option won't appear — but never shows the body.
+
+What is **not** documented anywhere: the actual JSON that triggers reuse. Neither worked example under "Create a Workload Domain by Using the VCF Operations API" reuses an existing NSX; both deploy a fresh cluster.
+
+### The shape in this file (inference, not documentation)
+
+Since the schema offers no reuse field, the only way to express "use that one" is to make `nsxTSpec` describe the cluster that already exists — SDDC Manager then matches it by identity rather than deploying new appliances. So:
+
+- `nsxTSpec.vipFqdn` — the **existing** cluster's VIP FQDN
+- `nsxTSpec.nsxManagerSpecs[]` — one entry per existing node, with that node's real `dnsName` and `ipAddress`
+- passwords — the **existing** cluster's passwords
+
+Get all of it from `GET /v1/nsxt-clusters?isShareable=true`. Do not invent FQDNs or IPs here: unfamiliar names are exactly what makes SDDC Manager build a *new* cluster instead of reusing the one you want.
+
+### Confirm it in one call
+
+`POST /v1/domains/validations` with this body. It is non-destructive and is the same gate the UI uses:
+
+- **Validation passes** → SDDC Manager intends to reuse the existing cluster. Safe to `POST /v1/domains`.
+- **Validation fails on FQDN/IP already in use** → it intends to deploy *new* managers, and this shape is wrong. Stop and rethink.
+
+Note also that `nsxTSpec.vip` is marked **`[Deprecated]`** in 9.1 (*"Can be omitted if FQDN is provided"*), so it is omitted here; `vipFqdn` is the required field.
+
+**Everything outside `nsxTSpec`** — vCenter, hosts, datastore, network profiles, cluster image — is identical in shape to the new-NSX variant and **is** verified against the 9.1 schema.
 
 ---
 

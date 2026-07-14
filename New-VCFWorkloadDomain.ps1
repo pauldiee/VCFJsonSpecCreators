@@ -652,12 +652,14 @@ while ($nsxNodeCount -notin @(1, 3)) {
     if ($nsxNodeCount -notin @(1, 3)) { Write-Host "  WARNING: Please enter 1 or 3." -ForegroundColor Yellow }
 }
 
-# vip is the VIP's IP address; vipFqdn is its FQDN. Both are required and they are NOT
-# the same value - v1.x put the FQDN in both, which is what this rewrite fixes.
+# vipFqdn is required. vip is the VIP's IP address and is marked [Deprecated] in the 9.1
+# schema ("Can be omitted if FQDN is provided"), so it is optional here - but if it IS
+# sent it must be an IP, not the FQDN. v1.x put the FQDN in both, which is the bug this
+# rewrite fixes.
 $nsxVipFqdn = Get-OrPrompt -Value $NSXVipFqdn -Prompt 'NSX Manager VIP FQDN' `
     -Validator { param($v) Test-FQDN $v } `
     -InvalidMessage 'Must be a valid FQDN (e.g. nsx-wld01-vip.vcf.lab).'
-$nsxVipIp = Get-OrPrompt -Value $NSXVipIp -Prompt 'NSX Manager VIP IP address' `
+$nsxVipIp = Get-OrPrompt -Value $NSXVipIp -Prompt 'NSX Manager VIP IP address (deprecated in 9.1 - press Enter to omit)' -Optional `
     -Validator { param($v) Test-IPAddress $v } `
     -InvalidMessage 'Must be a valid IPv4 address (e.g. 192.168.10.50).'
 
@@ -697,13 +699,15 @@ $nsxRootPassword  = Get-OrPrompt -Value '' -Prompt 'NSX root password' -Secure `
 $nsxTSpec = @{
     formFactor              = $nsxFormFactor
     nsxManagerSpecs         = $nsxManagerSpecs
-    vip                     = $nsxVipIp
     vipFqdn                 = $nsxVipFqdn
     nsxManagerAdminPassword = $nsxAdminPassword
     nsxManagerAuditPassword = $nsxAuditPassword
     nsxManagerRootPassword  = $nsxRootPassword
 }
-Write-Host "  NSX Manager: $nsxNodeCount node(s), VIP $nsxVipFqdn ($nsxVipIp)" -ForegroundColor Green
+if ($nsxVipIp -and $nsxVipIp.Trim() -ne '') { $nsxTSpec['vip'] = $nsxVipIp.Trim() }
+
+$vipSummary = if ($nsxVipIp -and $nsxVipIp.Trim() -ne '') { "$nsxVipFqdn ($nsxVipIp)" } else { "$nsxVipFqdn (vip omitted)" }
+Write-Host "  NSX Manager: $nsxNodeCount node(s), VIP $vipSummary" -ForegroundColor Green
 #endregion
 
 #region --- Step 8: Cluster image (personality) ---

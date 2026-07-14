@@ -17,10 +17,10 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 
 | Script | Version | Purpose |
 |---|---|---|
-| `New-VCFWorkloadDomain.ps1` | 1.6.0 | Create a new workload domain |
-| `New-VCFClusterSpec.ps1` | 1.1.0 | Add a cluster to an existing workload domain |
-| `New-VCFvSANStretchSpec.ps1` | 2.1.0 | Stretch an existing vSAN cluster across two availability zones |
-| `New-VCFNetworkPool.ps1` | 2.7.0 | Create a network pool in SDDC Manager |
+| `New-VCFWorkloadDomain.ps1` | 1.7.0 | Create a new workload domain |
+| `New-VCFClusterSpec.ps1` | 1.2.0 | Add a cluster to an existing workload domain |
+| `New-VCFvSANStretchSpec.ps1` | 2.2.0 | Stretch an existing vSAN cluster across two availability zones |
+| `New-VCFNetworkPool.ps1` | 2.8.0 | Create a network pool in SDDC Manager |
 
 ---
 

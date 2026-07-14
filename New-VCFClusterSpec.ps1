@@ -13,7 +13,7 @@
 
 .NOTES
     Script  : New-VCFClusterSpec.ps1
-    Version : 1.1.0
+    Version : 1.2.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-23
@@ -21,6 +21,10 @@
     Changelog:
         1.0.0 - Initial release
         1.1.0 - Removed ESXi license key prompt; added deployWithoutLicenseKeys = true to payload (VCF 9 consumption-based licensing)
+        1.2.0 - Windows PowerShell 5.1 compatibility: replaced non-ASCII dashes (the file is
+                BOM-less UTF-8, which 5.1 decodes as ANSI, corrupting the tokenizer); gated
+                -SkipCertificateCheck behind PSEdition -eq 'Core' so 5.1 falls back to the
+                TrustAll ICertificatePolicy instead of failing on an unknown parameter
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -36,7 +40,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFClusterSpec.ps1"
-    Version = "1.1.0"
+    Version = "1.2.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-23"
@@ -110,7 +114,7 @@ $MockHosts = @(
     [PSCustomObject]@{
         id          = 'host-mock-004'
         fqdn        = 'esxi-04.vcf.lab'
-        storageType = 'OSA'           # intentionally OSA — select with an ESA host to test mixed-storage abort
+        storageType = 'OSA'           # intentionally OSA - select with an ESA host to test mixed-storage abort
         cpu         = [PSCustomObject]@{ cores = 16 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 131072 }
     }
@@ -203,7 +207,17 @@ function Get-SDDCToken {
         username = $Credential.UserName
         password = $Credential.GetNetworkCredential().Password
     } | ConvertTo-Json
-    $resp = Invoke-RestMethod -Uri $uri -Method POST -ContentType 'application/json' -Body $body -SkipCertificateCheck
+    $params = @{
+        Uri         = $uri
+        Method      = 'POST'
+        ContentType = 'application/json'
+        Body        = $body
+    }
+    # PS 7+ supports -SkipCertificateCheck natively. Windows PowerShell 5.1 does not
+    # have the parameter at all; there the TrustAll ICertificatePolicy installed in
+    # the SSL region below is what bypasses validation.
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
+    $resp = Invoke-RestMethod @params
     return $resp.accessToken
 }
 
@@ -218,12 +232,12 @@ function Invoke-SDDC {
     $headers = @{ Authorization = "Bearer $Token" }
     $uri     = "https://$FQDN$Path"
     $params  = @{
-        Uri                  = $uri
-        Method               = $Method
-        Headers              = $headers
-        ContentType          = 'application/json'
-        SkipCertificateCheck = $true
+        Uri         = $uri
+        Method      = $Method
+        Headers     = $headers
+        ContentType = 'application/json'
     }
+    if ($PSVersionTable.PSEdition -eq 'Core') { $params['SkipCertificateCheck'] = $true }
     if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 20) }
     return Invoke-RestMethod @params
 }
@@ -380,7 +394,7 @@ foreach ($part in ($selection -split ',')) {
     } elseif ($part -match '^\d+$') {
         $indices += [int]$part - 1
     } else {
-        Write-Host "  Invalid selection token: '$part' — expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
+        Write-Host "  Invalid selection token: '$part' - expected a number or range (e.g. 1,2,3 or 1-3)." -ForegroundColor Red
         exit 1
     }
 }
@@ -492,7 +506,7 @@ $vsanVlan    = [int](Get-OrPrompt -Value $VSanVlanId    -Prompt 'vSAN port group
 $nsxTepVlan  = [int](Get-OrPrompt -Value $NSXTepVlanId  -Prompt 'NSX TEP (Geneve) VLAN ID (0-4094)' `
     -Validator { param($v) Test-VlanId $v } `
     -InvalidMessage 'VLAN ID must be an integer between 0 and 4094.')
-Write-Host "  VLAN IDs — vMotion: $vMotionVlan  |  vSAN: $vsanVlan  |  NSX TEP: $nsxTepVlan" -ForegroundColor Green
+Write-Host "  VLAN IDs - vMotion: $vMotionVlan  |  vSAN: $vsanVlan  |  NSX TEP: $nsxTepVlan" -ForegroundColor Green
 
 # -- NSX TEP IP pool (optional) --
 $nsxTepPoolSpec = $null
@@ -551,7 +565,7 @@ if ($allTepPoolVarsSet) {
             }
         )
     }
-    Write-Host "  TEP IP pool: $tepCidr  ($tepStart – $tepEnd, GW: $tepGateway)" -ForegroundColor Green
+    Write-Host "  TEP IP pool: $tepCidr  ($tepStart - $tepEnd, GW: $tepGateway)" -ForegroundColor Green
 } else {
     Write-Host "  DHCP will be used for NSX TEP IP assignment." -ForegroundColor Green
 }

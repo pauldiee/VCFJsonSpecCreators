@@ -14,7 +14,7 @@
 
 .NOTES
     Script  : New-VCFNetworkPool.ps1
-    Version : 2.7.0
+    Version : 2.8.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-24
@@ -42,6 +42,9 @@
                 aligned structure and banner with other VCF spec creator scripts
         2.7.0 - Relaxed subnet validation to accept any valid IPv4 address (not just x.x.x.0);
                 last octet is now automatically normalized to 0 before use
+        2.8.0 - Windows PowerShell 5.1 compatibility: replaced non-ASCII dashes (the file is
+                BOM-less UTF-8, which 5.1 decodes as ANSI). This script already gated
+                -SkipCertificateCheck correctly; no cert changes needed.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -101,7 +104,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFNetworkPool.ps1"
-    Version = "2.7.0"
+    Version = "2.8.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-24"
@@ -401,7 +404,7 @@ if ($SDDCManagerFQDN -and $SDDCManagerFQDN.Trim()) {
     $sddcManagerFqdn = if ($inputFqdn) { $inputFqdn } else { $defaultFqdn }
 }
 
-# Credentials (load from file, prompt, or prompt-and-save) — skipped in mock mode
+# Credentials (load from file, prompt, or prompt-and-save) - skipped in mock mode
 if (-not $MockMode) {
     $cred = Get-VcfCredential `
         -ManagerFqdn     $sddcManagerFqdn `
@@ -425,7 +428,7 @@ if ($MTU -and $MTU.Trim() -and ($MTU.Trim() -match '^\d+$')) {
     }
 }
 
-# Network parameters — loop until all inputs are valid
+# Network parameters - loop until all inputs are valid
 $prefilledVsanVlan    = $VSanVlanId    -and $VSanVlanId.Trim()    -and ($VSanVlanId.Trim()    -match '^\d+$') -and (Test-VlanId ([int]$VSanVlanId.Trim()))
 $prefilledVmotionVlan = $VMotionVlanId -and $VMotionVlanId.Trim() -and ($VMotionVlanId.Trim() -match '^\d+$') -and (Test-VlanId ([int]$VMotionVlanId.Trim()))
 $prefilledVsanSubnet  = $VSanSubnet    -and (Test-SubnetFormat $VSanSubnet.Trim())

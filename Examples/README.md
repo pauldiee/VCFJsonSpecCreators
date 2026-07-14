@@ -33,15 +33,25 @@ Pool names follow the format `NP-<cluster-name>` — e.g. `NP-cluster-mgmt-01a`.
 
 Creates a new workload domain and deploys a **new 3-node NSX Manager cluster** as part of the same operation.
 
+Verified field-by-field against a `POST /v1/domains` sample body taken from a live **VCF 9.1** SDDC Manager. Every key in this file exists in the 9.1 `DomainCreationSpec`.
+
 **Key values to replace:**
-- `vcenterSpec` — vCenter FQDN, IP, gateway, subnet mask, passwords, and appliance size (`tiny` / `small` / `medium` / `large` / `xlarge`)
-- `hostSpecs[].id` — host UUIDs from `GET /v1/hosts?status=UNASSIGNED_USEABLE`
-- `vlanId` values — vMotion, vSAN, and NSX TEP VLANs
-- `ipAddressPoolsSpec` — static TEP pool CIDR and range; remove this block entirely if using DHCP for TEPs
-- `nsxSpec.nsxManagerSpecs` — NSX Manager node FQDNs
-- `nsxSpec.vip` / `nsxSpec.vipFqdn` — NSX Manager virtual IP FQDN
-- `nsxSpec` passwords — NSX admin, audit, and root passwords
-- `networkPoolName` — must match an existing pool in SDDC Manager
+- `vcenterSpec` — vCenter FQDN, IP, gateway, subnet mask, root password, and appliance size (`tiny` / `small` / `medium` / `large` / `xlarge`)
+- `ssoDomainSpec.ssoDomainPassword` — the `administrator@vsphere.local` password (this is *not* `vcenterSpec.rootPassword`)
+- `dnsServers` / `ntpServers` — required at the top level in VCF 9.x
+- `clusterImageId` — a `personalityId` from `GET /v1/personalities`. **Mandatory for vCenter 9.0+**; the domain will not create without it
+- `hostSpecs[].id` / `hostName` — host UUIDs and FQDNs from `GET /v1/hosts?status=UNASSIGNED_USEABLE`
+- `nsxTSpec.vip` — the NSX Manager VIP **IP address**; `nsxTSpec.vipFqdn` is its **FQDN**. These are two different values
+- `nsxTSpec.nsxManagerSpecs[].networkDetailsSpec` — each NSX node needs `dnsName`, `ipAddress`, `gateway`, and `subnetMask`
+- `nsxTClusterSpec.uplinkProfiles[].transportVlan` — the NSX host TEP (overlay) VLAN
+- `ipAddressPoolsSpec` — static TEP pool CIDR and range. Omit it (and `nsxtHostSwitchConfigs[].ipAddressPoolName`) to use DHCP on the TEP VLAN
+
+**Things that are NOT in the VCF 9.1 spec**, despite appearing in VCF 5.x payloads and in earlier versions of this repo:
+- `portGroupSpecs[].vlanId` — port groups carry no VLAN ID. The vMotion and vSAN VLANs come from the **network pool** the hosts were bound to at commission time
+- a port group with `transportType: "NSX"` — `NSX` is not a legal enum value. The valid set is `VSAN, VMOTION, MANAGEMENT, PUBLIC, NFS, VREALIZE, ISCSI, EDGE_INFRA_OVERLAY_UPLINK, VM_MANAGEMENT, VSAN_EXTERNAL, FLEET_MANAGEMENT`
+- a top-level `networkPoolName` — not part of `DomainCreationSpec`
+- `nsxSpec` (it is `nsxTSpec`), and `nsxManagerSpecs[].networkDetails.fqdn` (it is `networkDetailsSpec`)
+- `nsxClusterSpec.geneveVlanId` — still present but **deprecated**: *"This field is deprecated, instead please use transportVlan in uplinkProfiles"*
 
 ---
 

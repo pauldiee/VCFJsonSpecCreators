@@ -14,7 +14,7 @@ Reference payloads for each script in this repository. These show the exact stru
 | `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` | ✅ **validated against a live 9.1 SDDC Manager** |
 | `workload-domain-existing-nsx.json` | *(no script — see notes)* | `POST /v1/domains` | ⚠️ **unverified** — NSX reuse is undocumented |
 | `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` | ✅ **validated against a live 9.1 SDDC Manager** |
-| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` | ⚠️ aligned to the documented 9.x `clusterStretchSpec`, but **not** validated against a live appliance |
+| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` | ✅ **used successfully on a live management domain** |
 
 > **Validated** means the payload was actually POSTed to the `/validations` endpoint of a live VCF 9.1 SDDC Manager and got past schema validation — it reached host resolution and failed only on placeholder host UUIDs (`ESXi Host(s) Not Found`). For contrast, the previous VCF 5.x-shaped payloads were rejected outright at the schema layer with `REST_INVALID_API_INPUT` / *"Invalid input"*.
 
@@ -126,6 +126,25 @@ Verified against a `POST /v1/clusters` sample body from a live **VCF 9.1** SDDC 
 ## vsan-stretch.json
 
 Stretches an existing vSAN cluster across two availability zones by adding second-AZ hosts, an NSX network profile (host TEP pool + uplink profile) for that zone, and a witness appliance.
+
+> **Field-proven on a management domain** — a live management-domain stretch using this shape completed successfully. The workload-domain variant differs by exactly one flag (`isDefault`, below) and has not been exercised end-to-end yet.
+>
+> **Do not "align" it to the domain/cluster specs.** `clusterStretchSpec` is a different model from `DomainCreationSpec`, and two differences that look like bugs are correct here:
+> - its `networkSpec.nsxClusterSpec` takes `{ipAddressPoolsSpec, uplinkProfiles}` **directly** — there is no `nsxTClusterSpec` wrapper, unlike the domain and cluster specs
+> - it uses lowercase **`hostname`**, where the domain and cluster specs use `hostName`
+>
+> Both are genuine model differences, not inconsistencies to be tidied up.
+
+### The one setting that differs between a management and a workload domain
+
+`networkProfiles[].isDefault` — and it is easy to get wrong, because nothing else in the payload changes:
+
+| Stretching | `isDefault` | Why |
+|---|---|---|
+| **Management domain** default cluster | `true` | The stretch spec defines the cluster's **first** VCF network profile, so the AZ2 profile *is* the default. |
+| **Workload domain** cluster | `false` | The AZ1 default profile already exists; the AZ2 profile is a **sub-config** hanging off it. |
+
+`New-VCFvSANStretchSpec.ps1` prompts for this directly: *"Is this the cluster's first VCF network profile? (y = management domain, n = workload domain)"*. The value in `vsan-stretch.json` is `false` (the workload-domain case) — flip it to `true` if you are stretching the management domain.
 
 This is the body for the stretch operation itself: `PATCH /v1/clusters/{id}`. To validate first, wrap the same content in one more level and POST it to `/v1/clusters/{id}/validations`:
 

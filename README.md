@@ -2,7 +2,12 @@
 
 > **Disclaimer:** These scripts are provided as-is. Use at your own risk. Always validate the generated JSON payload via the SDDC Manager API's validation endpoints before submitting to production.
 >
-> **Testing status (VCF 9.1):** the payloads built by `New-VCFWorkloadDomain.ps1` and `New-VCFClusterSpec.ps1` have been POSTed to the `/validations` endpoints of a live VCF 9.1 SDDC Manager and clear schema validation. `New-VCFvSANStretchSpec.ps1` has **not** been validated against a live appliance and may still carry VCF 5.x-era assumptions — see [issue #6](https://github.com/pauldiee/VCFJsonSpecCreators/issues/6).
+> **Testing status (VCF 9.1):**
+> - `New-VCFWorkloadDomain.ps1` and `New-VCFClusterSpec.ps1` — payloads POSTed to the `/validations` endpoints of a live VCF 9.1 SDDC Manager; both clear schema validation.
+> - `New-VCFvSANStretchSpec.ps1` — **used successfully on a live management domain**; the stretch completed. The workload-domain variant differs by one flag (`networkProfiles[].isDefault` = `false` for a workload domain, `true` for the management domain) and has not been exercised end-to-end yet.
+> - `New-VCFNetworkPool.ps1` — used against a live SDDC Manager.
+>
+> Note that `clusterStretchSpec` is a different model from `DomainCreationSpec` and is legitimately shaped differently: its `nsxClusterSpec` takes `{ipAddressPoolsSpec, uplinkProfiles}` **directly** (no `nsxTClusterSpec` wrapper), and it uses lowercase `hostname`. Do not "fix" it to match the domain spec.
 
 Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 

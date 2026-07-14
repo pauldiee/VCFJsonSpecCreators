@@ -11,12 +11,12 @@ Reference payloads for each script in this repository. These show the exact stru
 | File | Script | API Endpoint | 9.1 status |
 |---|---|---|---|
 | `network-pool.json` | `New-VCFNetworkPool.ps1` | `POST /v1/network-pools` | |
-| `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` | ✅ verified against a live 9.1 SDDC Manager |
+| `workload-domain-new-nsx.json` | `New-VCFWorkloadDomain.ps1` | `POST /v1/domains` | ✅ **validated against a live 9.1 SDDC Manager** |
 | `workload-domain-existing-nsx.json` | *(no script — see notes)* | `POST /v1/domains` | ⚠️ **unverified** — NSX reuse is undocumented |
-| `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` | ❗ still VCF 5.x-shaped — not yet reworked |
-| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` | aligned to the documented 9.x `clusterStretchSpec` |
+| `cluster-spec.json` | `New-VCFClusterSpec.ps1` | `POST /v1/clusters` | ✅ **validated against a live 9.1 SDDC Manager** |
+| `vsan-stretch.json` | `New-VCFvSANStretchSpec.ps1` | `PATCH /v1/clusters/{id}` | ⚠️ aligned to the documented 9.x `clusterStretchSpec`, but **not** validated against a live appliance |
 
-> **Verified** means every key path in the file was diffed against a `POST /v1/domains` sample body pulled from a live VCF 9.1 SDDC Manager, and none are unknown to the schema.
+> **Validated** means the payload was actually POSTed to the `/validations` endpoint of a live VCF 9.1 SDDC Manager and got past schema validation — it reached host resolution and failed only on placeholder host UUIDs (`ESXi Host(s) Not Found`). For contrast, the previous VCF 5.x-shaped payloads were rejected outright at the schema layer with `REST_INVALID_API_INPUT` / *"Invalid input"*.
 
 ---
 
@@ -108,13 +108,18 @@ Note also that `nsxTSpec.vip` is marked **`[Deprecated]`** in 9.1 (*"Can be omit
 
 Adds a new cluster to an existing workload domain.
 
+Verified against a `POST /v1/clusters` sample body from a live **VCF 9.1** SDDC Manager, and confirmed by a real `POST /v1/clusters/validations` call. The cluster body's `computeSpec.clusterSpecs[]` is **identical in shape** to the one inside `DomainCreationSpec` — only the top level differs (`domainId`, `deployWithoutLicenseKeys`, `dnsServers`, `ntpServers`).
+
 **Key values to replace:**
-- `domainId` — UUID of the target workload domain; retrieve it from `GET /v1/domains`
-- `hostSpecs[].id` — host UUIDs from `GET /v1/hosts?status=UNASSIGNED_USEABLE`
-- `vlanId` values — vMotion, vSAN, and NSX TEP VLANs
-- `ipAddressPoolsSpec` — static TEP pool CIDR and range; remove this block entirely if using DHCP for TEPs
-- `vsanSpec.esaConfig` — remove this block for OSA (original storage architecture)
-- `networkPoolName` — must match an existing pool in SDDC Manager
+- `domainId` — UUID of the target workload domain; from `GET /v1/domains`
+- `clusterImageId` — a `personalityId` from `GET /v1/personalities`. **Mandatory for vCenter 9.0+**
+- `hostSpecs[].id` / `hostName` — host UUIDs and FQDNs from `GET /v1/hosts?status=UNASSIGNED_USEABLE`
+- `dnsServers` / `ntpServers` — required at the top level in VCF 9.x
+- `nsxTClusterSpec.uplinkProfiles[].transportVlan` — the NSX host TEP (overlay) VLAN
+- `ipAddressPoolsSpec` — static TEP pool CIDR and range. Omit it (and `nsxtHostSwitchConfigs[].ipAddressPoolName`) to use DHCP on the TEP VLAN
+- `datastoreSpec.vsanDatastoreSpec.esaConfig.enabled` — `false` for OSA
+
+**Same VCF 5.x traps as the domain spec** — all removed here: no `portGroupSpecs[].vlanId`, no `transportType: "NSX"` port group, no top-level `networkPoolName`, no `vsanSpec` (it is `datastoreSpec.vsanDatastoreSpec`), and `nsxClusterSpec` must wrap its contents in `nsxTClusterSpec`.
 
 ---
 

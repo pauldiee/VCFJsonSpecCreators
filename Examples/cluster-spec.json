@@ -1,13 +1,19 @@
 {
-  "domainId": "<workload-domain-uuid>",
+  "domainId": "<workload-domain-uuid from GET /v1/domains>",
+  "deployWithoutLicenseKeys": true,
+  "dnsServers": [ "192.168.10.5", "192.168.10.6" ],
+  "ntpServers": [ "ntp1.vcf.lab", "ntp2.vcf.lab" ],
   "computeSpec": {
     "clusterSpecs": [
       {
         "name": "wld-cl-02",
+        "clusterImageId": "<personalityId from GET /v1/personalities>",
         "hostSpecs": [
           {
-            "id": "eeeeeeee-0005-0005-0005-eeeeeeeeeeee",
+            "id": "aaaaaaaa-0001-0001-0001-aaaaaaaaaaaa",
+            "hostName": "esxi-01.vcf.lab",
             "hostNetworkSpec": {
+              "networkProfileName": "wld-cl-02-network-profile01",
               "vmNics": [
                 { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
                 { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
@@ -15,8 +21,10 @@
             }
           },
           {
-            "id": "ffffffff-0006-0006-0006-ffffffffffff",
+            "id": "bbbbbbbb-0002-0002-0002-bbbbbbbbbbbb",
+            "hostName": "esxi-02.vcf.lab",
             "hostNetworkSpec": {
+              "networkProfileName": "wld-cl-02-network-profile01",
               "vmNics": [
                 { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
                 { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
@@ -24,17 +32,10 @@
             }
           },
           {
-            "id": "gggggggg-0007-0007-0007-gggggggggggg",
+            "id": "cccccccc-0003-0003-0003-cccccccccccc",
+            "hostName": "esxi-03.vcf.lab",
             "hostNetworkSpec": {
-              "vmNics": [
-                { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
-                { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
-              ]
-            }
-          },
-          {
-            "id": "hhhhhhhh-0008-0008-0008-hhhhhhhhhhhh",
-            "hostNetworkSpec": {
+              "networkProfileName": "wld-cl-02-network-profile01",
               "vmNics": [
                 { "id": "vmnic0", "vdsName": "wld-cl-02-vds01", "uplink": "uplink1" },
                 { "id": "vmnic1", "vdsName": "wld-cl-02-vds01", "uplink": "uplink2" }
@@ -42,12 +43,12 @@
             }
           }
         ],
-        "vsanSpec": {
-          "esaConfig": {
-            "enabled": true
-          },
-          "failuresToTolerate": 1,
-          "datastoreName": "wld-cl-02-vSAN-DS"
+        "datastoreSpec": {
+          "vsanDatastoreSpec": {
+            "datastoreName": "wld-cl-02-vSAN-DS",
+            "failuresToTolerate": 1,
+            "esaConfig": { "enabled": true }
+          }
         },
         "networkSpec": {
           "vdsSpecs": [
@@ -58,48 +59,67 @@
                 {
                   "name": "wld-cl-02-vMotion-pg",
                   "transportType": "VMOTION",
-                  "vlanId": 100,
                   "activeUplinks": [ "uplink1", "uplink2" ]
                 },
                 {
                   "name": "wld-cl-02-vSAN-pg",
                   "transportType": "VSAN",
-                  "vlanId": 101,
-                  "activeUplinks": [ "uplink1", "uplink2" ]
-                },
-                {
-                  "name": "wld-cl-02-nsx-tep-pg",
-                  "transportType": "NSX",
-                  "vlanId": 102,
                   "activeUplinks": [ "uplink1", "uplink2" ]
                 }
               ]
             }
           ],
           "nsxClusterSpec": {
-            "geneveVlanId": 102,
-            "ipAddressPoolsSpec": [
-              {
-                "name": "wld-cl-02-tep-pool",
-                "subnets": [
-                  {
-                    "cidr": "192.168.11.0/24",
-                    "gateway": "192.168.11.1",
-                    "ipAddressPoolRanges": [
-                      {
-                        "start": "192.168.11.50",
-                        "end": "192.168.11.70"
-                      }
-                    ]
-                  }
-                ]
-              }
-            ]
-          }
+            "nsxTClusterSpec": {
+              "uplinkProfiles": [
+                {
+                  "name": "wld-cl-02-uplink-profile01",
+                  "transportVlan": 102,
+                  "teamings": [
+                    {
+                      "policy": "LOADBALANCE_SRCID",
+                      "activeUplinks": [ "uplink-1", "uplink-2" ],
+                      "standByUplinks": []
+                    }
+                  ]
+                }
+              ],
+              "ipAddressPoolsSpec": [
+                {
+                  "name": "wld-cl-02-tep-pool",
+                  "description": "wld-cl-02 host TEP pool",
+                  "subnets": [
+                    {
+                      "cidr": "192.168.11.0/24",
+                      "gateway": "192.168.11.1",
+                      "ipAddressPoolRanges": [
+                        { "start": "192.168.11.50", "end": "192.168.11.70" }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "networkProfiles": [
+            {
+              "name": "wld-cl-02-network-profile01",
+              "isDefault": true,
+              "nsxtHostSwitchConfigs": [
+                {
+                  "vdsName": "wld-cl-02-vds01",
+                  "uplinkProfileName": "wld-cl-02-uplink-profile01",
+                  "ipAddressPoolName": "wld-cl-02-tep-pool",
+                  "vdsUplinkToNsxUplink": [
+                    { "vdsUplinkName": "uplink1", "nsxUplinkName": "uplink-1" },
+                    { "vdsUplinkName": "uplink2", "nsxUplinkName": "uplink-2" }
+                  ]
+                }
+              ]
+            }
+          ]
         }
       }
     ]
-  },
-  "networkPoolName": "NP-cluster-mgmt-01a",
-  "deployWithoutLicenseKeys": true
+  }
 }

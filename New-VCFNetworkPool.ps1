@@ -3,7 +3,7 @@
     Creates a Network Pool in SDDC Manager via the REST API and saves the JSON payload to disk.
 
 .DESCRIPTION
-    - Collects cluster name, SDDC Manager FQDN, MTU, VLAN IDs, and subnet configuration
+    - Collects cluster name, SDDC Manager FQDN, MTU, VLAN IDs, and CIDR-based network configuration
     - Validates all inputs before proceeding; re-prompts on errors
     - Derives the pool name by prepending "NP-" to the cluster name (e.g. NP-cluster-mgmt-01a)
     - Checks whether a pool with the same name already exists in SDDC Manager
@@ -14,14 +14,18 @@
 
 .NOTES
     Script  : New-VCFNetworkPool.ps1
-    Version : 2.8.0
+    Version : 3.0.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-24
 
     Compatibility:
-        VCF 5.0, 5.1, 5.2, and VCF 9.0
+        VCF 5.0, 5.1, 5.2, VCF 9.0 and 9.1
         Windows PowerShell 5.1 and PowerShell 7.x
+
+    Note: in VCF 9.1 the vMotion and vSAN VLANs and IP ranges live ONLY in the network pool.
+    They were removed from the workload domain and cluster specs (portGroupSpecs carries no
+    vlanId there), so the pool is the single source of truth for that addressing.
 
     VCF 9 note:
         The SDDC Manager UI no longer exposes network pool management (moved to
@@ -45,6 +49,20 @@
         2.8.0 - Windows PowerShell 5.1 compatibility: replaced non-ASCII dashes (the file is
                 BOM-less UTF-8, which 5.1 decodes as ANSI). This script already gated
                 -SkipCertificateCheck correctly; no cert changes needed.
+        3.0.0 - Networks are now defined by CIDR, not a bare subnet address. Previously the mask
+                was hardcoded to 255.255.255.0 and the gateway/range were derived arithmetically
+                as x.y.z.1 / x.y.z.10 / x.y.z.254 - i.e. a /24 was assumed and the pool range was
+                not configurable. On a /25 that produced a wrong mask AND an end address outside
+                the subnet (.254 does not exist in a /25). A real VCF 9.1 pool observed in the
+                field is a /25 with a deliberate 21-address window (10.2.3.101-121), which the
+                old code could not express at all.
+                  * input is now a CIDR (any prefix /1 to /30), e.g. 10.2.3.0/25
+                  * mask, network address and usable range are computed from the prefix
+                  * gateway defaults to the first usable address and is overridable
+                  * pool start/end are prompted (with derived defaults) and validated to fall
+                    inside the subnet, excluding the network and broadcast addresses
+                  * BREAKING: the $VSanSubnet / $VMotionSubnet pre-filled variables are replaced
+                    by $VSanCidr / $VMotionCidr (plus optional gateway and pool-range variables)
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -104,7 +122,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFNetworkPool.ps1"
-    Version = "2.8.0"
+    Version = "3.0.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-24"
@@ -137,8 +155,15 @@ $ClusterName        = ''          # e.g. cluster-mgmt-01a
 $MTU                = ''          # leave blank to default to 9000
 $VSanVlanId         = ''          # e.g. 1611
 $VMotionVlanId      = ''          # e.g. 1612
-$VSanSubnet         = ''          # e.g. 172.16.11.0  (/24 assumed; last octet normalized to 0)
-$VMotionSubnet      = ''          # e.g. 172.16.12.0  (/24 assumed; last octet normalized to 0)
+$VSanCidr           = ''          # e.g. 172.16.11.0/24  - any prefix, not just /24
+$VMotionCidr        = ''          # e.g. 172.16.12.0/25
+# Gateway and pool range: leave blank to be prompted (defaults are derived from the CIDR).
+$VSanGateway        = ''          # e.g. 172.16.11.1     (default: first usable address)
+$VSanPoolStart      = ''          # e.g. 172.16.11.101
+$VSanPoolEnd        = ''          # e.g. 172.16.11.121
+$VMotionGateway     = ''          # e.g. 172.16.12.1
+$VMotionPoolStart   = ''          # e.g. 172.16.12.101
+$VMotionPoolEnd     = ''          # e.g. 172.16.12.121
 
 $OutputJsonPath     = ''          # leave blank to auto-generate (.\NetworkPools\NP-<cluster-name>.json)
 
@@ -248,26 +273,95 @@ function Test-SubnetFormat {
     return (Test-IPv4Address -Address $Subnet)
 }
 
-function Get-NormalizedSubnet {
-    param([string]$Subnet)
-    $parts = $Subnet.Split('.')
-    return "$($parts[0]).$($parts[1]).$($parts[2]).0"
+function Test-CidrFormat {
+    param([string]$Cidr)
+    if ($Cidr -notmatch '^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})$') { return $false }
+    if (-not (Test-IPv4Address -Address $Matches[1])) { return $false }
+    $prefix = [int]$Matches[2]
+    # /31 and /32 leave no usable host range for a pool.
+    return ($prefix -ge 1 -and $prefix -le 30)
 }
 
-function Get-NetworkDetails {
-    param([string]$Subnet)
-    $parts = $Subnet.Split('.')
-    $base  = "$($parts[0]).$($parts[1]).$($parts[2])."
+function ConvertTo-UInt32Ip {
+    param([string]$Address)
+    $o = $Address.Split('.') | ForEach-Object { [uint32]$_ }
+    return ([uint32]$o[0] -shl 24) -bor ([uint32]$o[1] -shl 16) -bor ([uint32]$o[2] -shl 8) -bor [uint32]$o[3]
+}
+
+function ConvertFrom-UInt32Ip {
+    param([uint32]$Value)
+    return '{0}.{1}.{2}.{3}' -f `
+        (($Value -shr 24) -band 255), (($Value -shr 16) -band 255),
+        (($Value -shr 8)  -band 255), ($Value -band 255)
+}
+
+# Derives everything a network pool needs from a CIDR, for ANY prefix length.
+# The previous version hardcoded a /24 (mask 255.255.255.0, range .10-.254), which
+# silently produced an invalid pool on, say, a /25 - .254 does not exist in one.
+function Get-CidrInfo {
+    param([string]$Cidr)
+
+    $parts   = $Cidr.Split('/')
+    $prefix  = [int]$parts[1]
+    $ipVal   = ConvertTo-UInt32Ip $parts[0]
+
+    # Mask as a uint32. Guard the shift: 32 - 0 would be an undefined shift width.
+    $maskVal = if ($prefix -eq 0) { [uint32]0 } else { [uint32]::MaxValue -shl (32 - $prefix) }
+
+    $network   = $ipVal -band $maskVal
+    $broadcast = $network -bor (-bnot $maskVal)
+
     return @{
-        Gateway = $base + '1'
-        StartIP = $base + '10'
-        EndIP   = $base + '254'
+        Prefix      = $prefix
+        Network     = ConvertFrom-UInt32Ip $network
+        Mask        = ConvertFrom-UInt32Ip $maskVal
+        Broadcast   = ConvertFrom-UInt32Ip $broadcast
+        FirstUsable = ConvertFrom-UInt32Ip ($network + 1)
+        LastUsable  = ConvertFrom-UInt32Ip ($broadcast - 1)
+        NetworkVal  = $network
+        BroadcastVal= $broadcast
     }
+}
+
+# True when Address is a usable host address inside Cidr (excludes network + broadcast).
+function Test-IpInCidr {
+    param([string]$Address, [string]$Cidr)
+    if (-not (Test-IPv4Address -Address $Address)) { return $false }
+    $info = Get-CidrInfo -Cidr $Cidr
+    $val  = ConvertTo-UInt32Ip $Address
+    return ($val -gt $info.NetworkVal -and $val -lt $info.BroadcastVal)
 }
 
 function Test-VlanId {
     param([int]$VlanId)
     return ($VlanId -ge 0 -and $VlanId -le 4094)
+}
+
+function Test-MtuValue {
+    param([string]$Value)
+    if ($Value -notmatch '^\d+$') { return $false }
+    $m = [int]$Value
+    return ($m -ge 1280 -and $m -le 9216)
+}
+
+# The cluster name becomes the pool name (NP-<name>) AND part of the output file path
+# (.\NetworkPools\NP-<name>.json), so path separators and whitespace must be rejected.
+function Test-ClusterNameFormat {
+    param([string]$Value)
+    return [bool]($Value -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
+}
+
+function Test-FqdnFormat {
+    param([string]$Value)
+    return [bool]($Value -match '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)+$')
+}
+
+# True when two CIDRs overlap at all (either contains the other's network address).
+function Test-CidrOverlap {
+    param([string]$CidrA, [string]$CidrB)
+    $a = Get-CidrInfo -Cidr $CidrA
+    $b = Get-CidrInfo -Cidr $CidrB
+    return -not ($a.BroadcastVal -lt $b.NetworkVal -or $b.BroadcastVal -lt $a.NetworkVal)
 }
 
 function Read-RequiredHost {
@@ -382,26 +476,40 @@ $baseDir = Get-BaseDir
 
 Write-Host ("`n  [Step 1 of 4  --  Configuration Input]") -ForegroundColor Cyan
 
-# Cluster name
-if ($ClusterName -and $ClusterName.Trim()) {
+# Cluster name - becomes the pool name (NP-<name>) and part of the output file path,
+# so reject anything with whitespace or path separators in it.
+if ($ClusterName -and (Test-ClusterNameFormat $ClusterName.Trim())) {
     $clusterName = $ClusterName.Trim()
     Write-Host "  Cluster name      : $clusterName" -ForegroundColor DarkGray
 } else {
-    $clusterName = Read-RequiredHost '  Cluster name (e.g. cluster-mgmt-01a)'
+    if ($ClusterName -and $ClusterName.Trim()) {
+        Write-Warning "Pre-filled ClusterName '$ClusterName' is invalid."
+    }
+    do {
+        $clusterName = (Read-Host '  Cluster name (e.g. cluster-mgmt-01a)').Trim()
+        $ok = Test-ClusterNameFormat $clusterName
+        if (-not $ok) {
+            Write-Warning 'Cluster name must start with a letter or digit and contain only letters, digits, dots, hyphens or underscores (no spaces or slashes).'
+        }
+    } until ($ok)
 }
 
 # SDDC Manager FQDN
-if ($SDDCManagerFQDN -and $SDDCManagerFQDN.Trim()) {
+if ($SDDCManagerFQDN -and (Test-FqdnFormat $SDDCManagerFQDN.Trim())) {
     $sddcManagerFqdn = $SDDCManagerFQDN.Trim()
     Write-Host "  SDDC Manager FQDN : $sddcManagerFqdn" -ForegroundColor DarkGray
 } elseif ($MockMode) {
     $sddcManagerFqdn = 'sddc-manager.vcf.lab'
     Write-Host "  [MOCK] SDDC Manager FQDN: $sddcManagerFqdn" -ForegroundColor DarkYellow
 } else {
-    $derivedDC       = $clusterName.Substring(0, [Math]::Min(3, $clusterName.Length))
-    $defaultFqdn     = "$derivedDC.mydns.local"   # <-- adjust default domain to match your environment
-    $inputFqdn       = (Read-Host "  SDDC Manager FQDN [$defaultFqdn] (press Enter to accept)").Trim()
-    $sddcManagerFqdn = if ($inputFqdn) { $inputFqdn } else { $defaultFqdn }
+    if ($SDDCManagerFQDN -and $SDDCManagerFQDN.Trim()) {
+        Write-Warning "Pre-filled SDDCManagerFQDN '$SDDCManagerFQDN' is not a valid FQDN."
+    }
+    do {
+        $sddcManagerFqdn = (Read-Host '  SDDC Manager FQDN (e.g. sddc-manager.vcf.lab)').Trim()
+        $ok = Test-FqdnFormat $sddcManagerFqdn
+        if (-not $ok) { Write-Warning 'Must be a valid FQDN (e.g. sddc-manager.vcf.lab).' }
+    } until ($ok)
 }
 
 # Credentials (load from file, prompt, or prompt-and-save) - skipped in mock mode
@@ -413,71 +521,174 @@ if (-not $MockMode) {
         -BaseDir         $baseDir
 }
 
-# MTU
-if ($MTU -and $MTU.Trim() -and ($MTU.Trim() -match '^\d+$')) {
+# MTU - must be numeric and in range. The old code cast the raw input with [int] before
+# checking it was a number at all, so a typo like "90o0" threw instead of re-prompting,
+# and an out-of-range value only warned and carried on.
+if ($MTU -and (Test-MtuValue $MTU.Trim())) {
     [int]$mtu = [int]$MTU.Trim()
     Write-Host "  MTU               : $mtu" -ForegroundColor DarkGray
-    if ($mtu -lt 1280 -or $mtu -gt 9216) {
-        Write-Warning "MTU value $mtu is outside the typical range (1280-9216). Proceeding anyway."
-    }
 } else {
-    $mtuInput = (Read-Host '  MTU [9000] (press Enter to accept)').Trim()
-    [int]$mtu = if ($mtuInput) { [int]$mtuInput } else { 9000 }
-    if ($mtu -lt 1280 -or $mtu -gt 9216) {
-        Write-Warning "MTU value $mtu is outside the typical range (1280-9216). Proceeding anyway."
+    if ($MTU -and $MTU.Trim()) {
+        Write-Warning "Pre-filled MTU '$MTU' is invalid (must be an integer between 1280 and 9216)."
+    }
+    do {
+        $mtuInput = (Read-Host '  MTU [9000] (press Enter to accept)').Trim()
+        if (-not $mtuInput) { $mtuInput = '9000' }
+        $ok = Test-MtuValue $mtuInput
+        if (-not $ok) { Write-Warning 'MTU must be an integer between 1280 and 9216.' }
+    } until ($ok)
+    [int]$mtu = [int]$mtuInput
+}
+
+# Collects VLAN + CIDR + gateway + pool range for one network, deriving sensible
+# defaults from the CIDR and validating that every address lands inside the subnet.
+function Read-NetworkConfig {
+    param(
+        [string]$Label,           # 'vSAN' / 'vMotion'
+        [string]$ExampleCidr,
+        [string]$PrefillVlan,
+        [string]$PrefillCidr,
+        [string]$PrefillGateway,
+        [string]$PrefillStart,
+        [string]$PrefillEnd
+    )
+
+    Write-Host ""
+    Write-Host "  -- $Label network --" -ForegroundColor White
+
+    # VLAN
+    $vlan = $null
+    if ($PrefillVlan -and $PrefillVlan.Trim() -match '^\d+$' -and (Test-VlanId ([int]$PrefillVlan.Trim()))) {
+        $vlan = [int]$PrefillVlan.Trim()
+        Write-Host "  $Label VLAN ID: $vlan (pre-filled)" -ForegroundColor DarkGray
+    } else {
+        do {
+            $in = (Read-Host "  $Label VLAN ID (0-4094)").Trim()
+            $ok = ($in -match '^\d+$') -and (Test-VlanId ([int]$in))
+            if (-not $ok) { Write-Warning "VLAN ID must be a number between 0 and 4094." }
+        } until ($ok)
+        $vlan = [int]$in
+    }
+
+    # CIDR
+    $cidr = $null
+    if ($PrefillCidr -and (Test-CidrFormat $PrefillCidr.Trim())) {
+        $cidr = $PrefillCidr.Trim()
+        Write-Host "  $Label CIDR: $cidr (pre-filled)" -ForegroundColor DarkGray
+    } else {
+        do {
+            $in = (Read-Host "  $Label CIDR (e.g. $ExampleCidr)").Trim()
+            $ok = Test-CidrFormat $in
+            if (-not $ok) { Write-Warning "Must be a valid CIDR with a prefix between /1 and /30 (e.g. $ExampleCidr)." }
+        } until ($ok)
+        $cidr = $in
+    }
+
+    $info = Get-CidrInfo -Cidr $cidr
+    Write-Host ("  -> network {0}  mask {1}  usable {2} - {3}" -f `
+        $info.Network, $info.Mask, $info.FirstUsable, $info.LastUsable) -ForegroundColor DarkGray
+
+    # Gateway - defaults to the first usable address
+    $gw = $null
+    if ($PrefillGateway -and (Test-IpInCidr $PrefillGateway.Trim() $cidr)) {
+        $gw = $PrefillGateway.Trim()
+    } else {
+        do {
+            $in = (Read-Host ("  $Label gateway (Enter for {0})" -f $info.FirstUsable)).Trim()
+            if (-not $in) { $in = $info.FirstUsable }
+            $ok = Test-IpInCidr $in $cidr
+            if (-not $ok) { Write-Warning "Gateway must be a usable address inside $cidr." }
+        } until ($ok)
+        $gw = $in
+    }
+
+    # Pool range - defaults to everything after the gateway, up to the last usable address
+    $defStart = ConvertFrom-UInt32Ip ((ConvertTo-UInt32Ip $gw) + 1)
+    $defEnd   = $info.LastUsable
+
+    $start = $null; $end = $null
+    $prefillRangeOk = $PrefillStart -and $PrefillEnd -and
+                      (Test-IpInCidr $PrefillStart.Trim() $cidr) -and
+                      (Test-IpInCidr $PrefillEnd.Trim() $cidr) -and
+                      ((ConvertTo-UInt32Ip $PrefillStart.Trim()) -le (ConvertTo-UInt32Ip $PrefillEnd.Trim())) -and
+                      -not ((ConvertTo-UInt32Ip $gw) -ge (ConvertTo-UInt32Ip $PrefillStart.Trim()) -and
+                            (ConvertTo-UInt32Ip $gw) -le (ConvertTo-UInt32Ip $PrefillEnd.Trim()))
+    if ($prefillRangeOk) {
+        $start = $PrefillStart.Trim(); $end = $PrefillEnd.Trim()
+    } else {
+        do {
+            $errs = @()
+            $sIn = (Read-Host "  $Label pool start (Enter for $defStart)").Trim()
+            if (-not $sIn) { $sIn = $defStart }
+            $eIn = (Read-Host "  $Label pool end   (Enter for $defEnd)").Trim()
+            if (-not $eIn) { $eIn = $defEnd }
+
+            if (-not (Test-IpInCidr $sIn $cidr)) { $errs += "Pool start '$sIn' is not a usable address inside $cidr." }
+            if (-not (Test-IpInCidr $eIn $cidr)) { $errs += "Pool end '$eIn' is not a usable address inside $cidr." }
+            if ($errs.Count -eq 0) {
+                $sVal = ConvertTo-UInt32Ip $sIn
+                $eVal = ConvertTo-UInt32Ip $eIn
+                $gVal = ConvertTo-UInt32Ip $gw
+                if ($sVal -gt $eVal) {
+                    $errs += "Pool start '$sIn' is after pool end '$eIn'."
+                }
+                # The gateway must not be handed out to a host.
+                elseif ($gVal -ge $sVal -and $gVal -le $eVal) {
+                    $errs += "Pool range $sIn - $eIn contains the gateway $gw. Exclude the gateway from the pool."
+                }
+            }
+            $errs | ForEach-Object { Write-Warning $_ }
+        } until ($errs.Count -eq 0)
+        $start = $sIn; $end = $eIn
+    }
+
+    return @{
+        VlanId  = $vlan
+        Subnet  = $info.Network
+        Mask    = $info.Mask
+        Gateway = $gw
+        Start   = $start
+        End     = $end
+        Cidr    = $cidr
     }
 }
 
-# Network parameters - loop until all inputs are valid
-$prefilledVsanVlan    = $VSanVlanId    -and $VSanVlanId.Trim()    -and ($VSanVlanId.Trim()    -match '^\d+$') -and (Test-VlanId ([int]$VSanVlanId.Trim()))
-$prefilledVmotionVlan = $VMotionVlanId -and $VMotionVlanId.Trim() -and ($VMotionVlanId.Trim() -match '^\d+$') -and (Test-VlanId ([int]$VMotionVlanId.Trim()))
-$prefilledVsanSubnet  = $VSanSubnet    -and (Test-SubnetFormat $VSanSubnet.Trim())
-$prefilledVmotionSub  = $VMotionSubnet -and (Test-SubnetFormat $VMotionSubnet.Trim())
+$vsanNet = Read-NetworkConfig -Label 'vSAN' -ExampleCidr '172.16.11.0/24' `
+    -PrefillVlan $VSanVlanId -PrefillCidr $VSanCidr -PrefillGateway $VSanGateway `
+    -PrefillStart $VSanPoolStart -PrefillEnd $VSanPoolEnd
 
-if ($prefilledVsanVlan -and $prefilledVmotionVlan -and $prefilledVsanSubnet -and $prefilledVmotionSub) {
-    [int]$vsanVlanId    = [int]$VSanVlanId.Trim()
-    [int]$vmotionVlanId = [int]$VMotionVlanId.Trim()
-    $vsanSubnet         = $VSanSubnet.Trim()
-    $vmotionSubnet      = $VMotionSubnet.Trim()
-    Write-Host "  vSAN    VLAN / subnet : $vsanVlanId / $vsanSubnet" -ForegroundColor DarkGray
-    Write-Host "  vMotion VLAN / subnet : $vmotionVlanId / $vmotionSubnet" -ForegroundColor DarkGray
-} else {
-    do {
-        $inputErrors = @()
+$vmotionNet = Read-NetworkConfig -Label 'vMotion' -ExampleCidr '172.16.12.0/25' `
+    -PrefillVlan $VMotionVlanId -PrefillCidr $VMotionCidr -PrefillGateway $VMotionGateway `
+    -PrefillStart $VMotionPoolStart -PrefillEnd $VMotionPoolEnd
 
-        $vsanVlanInput    = (Read-Host '  vSAN VLAN ID (0-4094)').Trim()
-        $vmotionVlanInput = (Read-Host '  vMotion VLAN ID (0-4094)').Trim()
-        $vsanSubnet       = (Read-Host '  vSAN subnet   (e.g. 192.168.10.0)').Trim()
-        $vmotionSubnet    = (Read-Host '  vMotion subnet (e.g. 192.168.20.0)').Trim()
-
-        if (-not ($vsanVlanInput -match '^\d+$'))         { $inputErrors += 'vSAN VLAN ID must be a number.' }
-        elseif (-not (Test-VlanId ([int]$vsanVlanInput))) { $inputErrors += "vSAN VLAN ID $vsanVlanInput is out of range (0-4094)." }
-
-        if (-not ($vmotionVlanInput -match '^\d+$'))         { $inputErrors += 'vMotion VLAN ID must be a number.' }
-        elseif (-not (Test-VlanId ([int]$vmotionVlanInput))) { $inputErrors += "vMotion VLAN ID $vmotionVlanInput is out of range (0-4094)." }
-
-        if (-not (Test-SubnetFormat $vsanSubnet))    { $inputErrors += "vSAN subnet '$vsanSubnet' is invalid. Use a valid IPv4 address (e.g. 192.168.10.0)." }
-        if (-not (Test-SubnetFormat $vmotionSubnet)) { $inputErrors += "vMotion subnet '$vmotionSubnet' is invalid. Use a valid IPv4 address (e.g. 192.168.20.0)." }
-
-        if ($inputErrors.Count -gt 0) {
-            $inputErrors | ForEach-Object { Write-Warning $_ }
-            Write-Host ""
-        }
-    } until ($inputErrors.Count -eq 0)
-
-    [int]$vsanVlanId    = $vsanVlanInput
-    [int]$vmotionVlanId = $vmotionVlanInput
+# Cross-network sanity: the two networks must be genuinely distinct. Neither of these is
+# catchable inside Read-NetworkConfig, which only ever sees one network at a time.
+$crossErrors = @()
+if ($vsanNet.VlanId -eq $vmotionNet.VlanId) {
+    $crossErrors += "vSAN and vMotion are both on VLAN $($vsanNet.VlanId). They must use different VLANs."
+}
+if (Test-CidrOverlap $vsanNet.Cidr $vmotionNet.Cidr) {
+    $crossErrors += "vSAN ($($vsanNet.Cidr)) and vMotion ($($vmotionNet.Cidr)) overlap. They must be separate subnets."
+}
+if ($crossErrors.Count -gt 0) {
+    Write-Host ""
+    $crossErrors | ForEach-Object { Write-Warning $_ }
+    Write-Host ""
+    Write-Host "  Re-run the script with corrected values." -ForegroundColor Red
+    exit 1
 }
 
 # Derive pool name
 $networkPoolName = "NP-$clusterName"
 
 Write-Host ""
-Write-Host "  Network pool name : $networkPoolName"                             -ForegroundColor Yellow
-Write-Host "  SDDC Manager      : $sddcManagerFqdn"                            -ForegroundColor Yellow
-Write-Host "  MTU               : $mtu"                                        -ForegroundColor Yellow
-Write-Host "  vSAN              : VLAN $vsanVlanId   Subnet $vsanSubnet"       -ForegroundColor Yellow
-Write-Host "  vMotion           : VLAN $vmotionVlanId  Subnet $vmotionSubnet"  -ForegroundColor Yellow
+Write-Host "  Network pool name : $networkPoolName"   -ForegroundColor Yellow
+Write-Host "  SDDC Manager      : $sddcManagerFqdn"   -ForegroundColor Yellow
+Write-Host "  MTU               : $mtu"               -ForegroundColor Yellow
+Write-Host ("  vSAN              : VLAN {0}  {1}  mask {2}  gw {3}  pool {4} - {5}" -f `
+    $vsanNet.VlanId, $vsanNet.Subnet, $vsanNet.Mask, $vsanNet.Gateway, $vsanNet.Start, $vsanNet.End) -ForegroundColor Yellow
+Write-Host ("  vMotion           : VLAN {0}  {1}  mask {2}  gw {3}  pool {4} - {5}" -f `
+    $vmotionNet.VlanId, $vmotionNet.Subnet, $vmotionNet.Mask, $vmotionNet.Gateway, $vmotionNet.Start, $vmotionNet.End) -ForegroundColor Yellow
 Write-Host ""
 
 #endregion
@@ -530,32 +741,26 @@ if ($MockMode) {
 
 Write-Host ("`n  [Step 3 of 4  --  Build and Save JSON]") -ForegroundColor Cyan
 
-$vsanSubnet     = Get-NormalizedSubnet -Subnet $vsanSubnet
-$vmotionSubnet  = Get-NormalizedSubnet -Subnet $vmotionSubnet
-
-$vsanDetails    = Get-NetworkDetails -Subnet $vsanSubnet
-$vmotionDetails = Get-NetworkDetails -Subnet $vmotionSubnet
-
 $payload = [ordered]@{
     name     = $networkPoolName
     networks = @(
         [ordered]@{
             type    = 'VSAN'
-            vlanId  = $vsanVlanId
+            vlanId  = $vsanNet.VlanId
             mtu     = $mtu
-            subnet  = $vsanSubnet
-            mask    = '255.255.255.0'
-            gateway = $vsanDetails.Gateway
-            ipPools = @(@{ start = $vsanDetails.StartIP; end = $vsanDetails.EndIP })
+            subnet  = $vsanNet.Subnet
+            mask    = $vsanNet.Mask
+            gateway = $vsanNet.Gateway
+            ipPools = @(@{ start = $vsanNet.Start; end = $vsanNet.End })
         },
         [ordered]@{
             type    = 'VMOTION'
-            vlanId  = $vmotionVlanId
+            vlanId  = $vmotionNet.VlanId
             mtu     = $mtu
-            subnet  = $vmotionSubnet
-            mask    = '255.255.255.0'
-            gateway = $vmotionDetails.Gateway
-            ipPools = @(@{ start = $vmotionDetails.StartIP; end = $vmotionDetails.EndIP })
+            subnet  = $vmotionNet.Subnet
+            mask    = $vmotionNet.Mask
+            gateway = $vmotionNet.Gateway
+            ipPools = @(@{ start = $vmotionNet.Start; end = $vmotionNet.End })
         }
     )
 }

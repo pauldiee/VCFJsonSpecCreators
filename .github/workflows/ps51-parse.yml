@@ -1,0 +1,54 @@
+name: PS 5.1 Parse Check
+
+# Enforces the CLAUDE.md hard constraint: every .ps1 must parse under
+# Windows PowerShell 5.1. `shell: powershell` on a windows runner is the
+# Desktop 5.1 engine, so this reproduces the exact ParseFile check that
+# CLAUDE.md prescribes for local verification - a script that only parses
+# under pwsh 7 will fail here and cannot be merged. See issue #2, #12.
+
+on:
+  pull_request:
+    branches: [ master ]
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    name: PS 5.1 Parse
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every .ps1 with the Windows PowerShell 5.1 parser
+        shell: powershell
+        run: |
+          Write-Host "Engine: PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+          if ($PSVersionTable.PSEdition -ne 'Desktop') {
+            Write-Host "::error::Expected the Desktop (5.1) engine, got $($PSVersionTable.PSEdition)"
+            exit 1
+          }
+
+          $failed = $false
+          Get-ChildItem -Path . -Filter *.ps1 -Recurse | Sort-Object FullName | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            $rel = Resolve-Path -Relative $_.FullName
+            if ($errs) {
+              $failed = $true
+              Write-Host "FAIL: $rel"
+              $errs | Select-Object -First 5 | ForEach-Object {
+                Write-Host "::error file=$rel,line=$($_.Extent.StartLineNumber)::$($_.Message)"
+              }
+            } else {
+              Write-Host "PASS: $rel"
+            }
+          }
+
+          if ($failed) {
+            Write-Host "::error::One or more scripts failed the Windows PowerShell 5.1 parse check."
+            exit 1
+          }
+          Write-Host "All scripts parse under Windows PowerShell 5.1."

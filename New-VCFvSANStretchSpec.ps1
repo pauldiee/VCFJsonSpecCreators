@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.2.2
+    Version : 2.3.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -44,6 +44,12 @@
             URL instead of spinning the full 300s. Result fields (resultStatus,
             validationChecks) read via Get-PropOrDefault - same StrictMode hazard as the
             host list. Endpoints unchanged: POST and GET are both cluster-scoped.
+    2.3.0 - The JSON is now written to disk BEFORE validation, not after. Validation is a long
+            round trip that can fail, time out or be interrupted, and the payload is 30+
+            prompts of work - a failed validation should cost a retry, not the whole run.
+            The validation prompt is reworded to match ("Validate the JSON with this script?")
+            since answering n now leaves you with a saved spec rather than nothing.
+            Also fixed $ScriptMeta.Version, which was still reporting 2.2.0 in the banner.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -59,7 +65,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "2.2.0"
+    Version = "2.3.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-10"
@@ -642,6 +648,35 @@ $jsonOutput = $payload | ConvertTo-Json -Depth 20
 Write-Host "  JSON payload built successfully." -ForegroundColor Green
 #endregion
 
+#region --- Save JSON to file ---
+# Written BEFORE validation on purpose: validation is a long round trip that can fail,
+# time out or be interrupted, and the payload is 30+ prompts of work. Get it on disk
+# first so a failed validation costs a retry, not the whole run.
+Write-Host ("`n  [Output  --  Saving JSON]") -ForegroundColor Cyan
+
+if ($OutputJsonPath -and $OutputJsonPath.Trim() -ne '') {
+    $parentDir = Split-Path -Parent $OutputJsonPath
+    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir -PathType Container)) {
+        Write-Host "  WARNING: Output directory '$parentDir' does not exist. Falling back to script directory." -ForegroundColor Yellow
+        $OutputJsonPath = ''
+    }
+}
+if (-not $OutputJsonPath -or $OutputJsonPath.Trim() -eq '') {
+    $ts             = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $scriptDir      = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $clusterSlug    = $selectedCluster.name -replace '[^a-zA-Z0-9\-_]', '-'
+    $OutputJsonPath = Join-Path $scriptDir "$clusterSlug-vsan-stretch-$ts.json"
+}
+
+try {
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($OutputJsonPath, $jsonOutput, $utf8Bom)
+    Write-Host "  JSON saved to: $OutputJsonPath" -ForegroundColor Green
+} catch {
+    Write-Host "  Failed to save JSON: $_" -ForegroundColor Red
+}
+#endregion
+
 #region --- Validate ---
 Write-Host ("`n  [Validation  --  SDDC Manager API]") -ForegroundColor Cyan
 
@@ -650,9 +685,15 @@ if ($MockMode) {
     Write-Host ''
     Write-Host "  Validation PASSED (mock). Stretch spec JSON is ready for review." -ForegroundColor Green
 } else {
+    Write-Host ''
+    Write-Host '  The JSON is already saved. Validation is optional from here: the script can' -ForegroundColor White
+    Write-Host '  submit it and poll for the result, or you can validate it yourself in SDDC' -ForegroundColor White
+    Write-Host '  Manager and skip ahead to the execute step.' -ForegroundColor White
+    Write-Host ''
+
     $validateChoice = ''
     while ($validateChoice -notin @('y', 'n')) {
-        $validateChoice = (Read-Host -Prompt 'Submit for validation against SDDC Manager? (y/n)').ToLower()
+        $validateChoice = (Read-Host -Prompt 'Validate the JSON with this script? (y/n)').ToLower()
         if ($validateChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
     }
 
@@ -675,6 +716,7 @@ if ($MockMode) {
             # TASK_NOT_FOUND on the GET means this id is not the one the status endpoint
             # wants, and without the raw body there is no way to tell which field is.
             Write-Host "  POST response fields: $($validationResp.PSObject.Properties.Name -join ', ')" -ForegroundColor DarkGray
+
             Write-Host "  Polling for validation result ..." -ForegroundColor Cyan
 
             $maxWait     = 300
@@ -752,34 +794,9 @@ if ($MockMode) {
             }
         }
     } else {
-        Write-Host "  WARNING: Validation skipped. Review the JSON before deploying." -ForegroundColor Yellow
+        Write-Host "  WARNING: Validation skipped. Review the JSON before deploying:" -ForegroundColor Yellow
+        Write-Host "    $OutputJsonPath" -ForegroundColor DarkGray
     }
-}
-#endregion
-
-#region --- Save JSON to file ---
-Write-Host ("`n  [Output  --  Saving JSON]") -ForegroundColor Cyan
-
-if ($OutputJsonPath -and $OutputJsonPath.Trim() -ne '') {
-    $parentDir = Split-Path -Parent $OutputJsonPath
-    if ($parentDir -and -not (Test-Path -LiteralPath $parentDir -PathType Container)) {
-        Write-Host "  WARNING: Output directory '$parentDir' does not exist. Falling back to script directory." -ForegroundColor Yellow
-        $OutputJsonPath = ''
-    }
-}
-if (-not $OutputJsonPath -or $OutputJsonPath.Trim() -eq '') {
-    $ts             = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $scriptDir      = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $clusterSlug    = $selectedCluster.name -replace '[^a-zA-Z0-9\-_]', '-'
-    $OutputJsonPath = Join-Path $scriptDir "$clusterSlug-vsan-stretch-$ts.json"
-}
-
-try {
-    $utf8Bom = New-Object System.Text.UTF8Encoding $true
-    [System.IO.File]::WriteAllText($OutputJsonPath, $jsonOutput, $utf8Bom)
-    Write-Host "  JSON saved to: $OutputJsonPath" -ForegroundColor Green
-} catch {
-    Write-Host "  Failed to save JSON: $_" -ForegroundColor Red
 }
 #endregion
 

@@ -11,6 +11,12 @@
 
 Interactive PowerShell scripts that build, validate, and export **VMware Cloud Foundation** JSON payloads via the SDDC Manager API — no manual JSON editing required.
 
+> ### Scope: vSAN only
+>
+> These scripts build **vSAN clusters only**. `datastoreSpec` is always `vsanDatastoreSpec`; the ESA/OSA prompt is a choice *within* vSAN (it sets `esaConfig.enabled`), not a choice of principal storage.
+>
+> The SDDC Manager UI also offers **NFS**, **VMFS on FC** and **vVol** on its Storage page. None of those have a code path here — they are not partially supported or untested, they are absent. NFS and VMFS on FC are planned ([#18](https://github.com/pauldiee/VCFJsonSpecCreators/issues/18)); vVol is deliberately out of scope, as Broadcom is deprecating it.
+
 ## Workflow
 
 These scripts are the second step in a two-repo VCF deployment workflow:

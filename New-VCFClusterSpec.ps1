@@ -11,6 +11,11 @@
     - Saves the JSON to disk
     - Supports mock mode for offline/lab testing without live SDDC Manager
 
+    SCOPE: vSAN clusters only. datastoreSpec is always vsanDatastoreSpec, and the ESA/OSA
+    prompt is a choice within vSAN (esaConfig.enabled), not a choice of principal storage.
+    NFS and VMFS on FC are not implemented (see issue #18); vVol is out of scope, as
+    Broadcom is deprecating it.
+
 .NOTES
     Script  : New-VCFClusterSpec.ps1
     Version : 2.1.0
@@ -493,6 +498,9 @@ Write-Host ("`n  [Step 4 of 7  --  vSAN Storage Type]") -ForegroundColor Cyan
 # It was previously read from $selectedHosts[].storageType, which does not exist on
 # unassigned hosts - /v1/hosts?status=UNASSIGNED_USEABLE never returns that field, so
 # the detection could not work and silently defaulted the cluster to OSA. See issue #16.
+Write-Host ''
+Write-Host '  This script builds vSAN clusters only - NFS, VMFS on FC and vVol are not' -ForegroundColor White
+Write-Host '  supported. The choice below is ESA vs OSA within vSAN.' -ForegroundColor White
 Write-Host ''
 Write-Host '  vSAN ESA (Express Storage Architecture) or vSAN OSA (Original)?' -ForegroundColor White
 Write-Host '  ESA requires supported all-flash hardware and a compatible vSAN release.' -ForegroundColor White

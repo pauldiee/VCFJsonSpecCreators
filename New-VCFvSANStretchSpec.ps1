@@ -668,8 +668,13 @@ if ($MockMode) {
         }
 
         if ($validationResp) {
-            $validationId = $validationResp.id
+            $validationId = Get-PropOrDefault $validationResp 'id' $null
             Write-Host "  Validation submitted. ID: $validationId" -ForegroundColor Green
+
+            # The POST response shape decides which id is pollable. Keep it visible: a
+            # TASK_NOT_FOUND on the GET means this id is not the one the status endpoint
+            # wants, and without the raw body there is no way to tell which field is.
+            Write-Host "  POST response fields: $($validationResp.PSObject.Properties.Name -join ', ')" -ForegroundColor DarkGray
             Write-Host "  Polling for validation result ..." -ForegroundColor Cyan
 
             $maxWait     = 300
@@ -705,6 +710,9 @@ if ($MockMode) {
                         Write-Host "  Giving up on polling after $failStreak consecutive failures." -ForegroundColor Yellow
                         Write-Host "  The validation may still be running. Check it manually:" -ForegroundColor Yellow
                         Write-Host "    GET https://$SDDCManagerFQDN$pollPath" -ForegroundColor DarkGray
+                        Write-Host ''
+                        Write-Host '  Raw POST response (which field is the pollable id?):' -ForegroundColor DarkGray
+                        Write-Host ($validationResp | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
                         break
                     }
                     continue

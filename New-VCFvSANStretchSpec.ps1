@@ -38,11 +38,12 @@
             cpu/memory) on an unassigned host, and Set-StrictMode -Version Latest turns a
             missing property into a terminating error. Reads now go through Get-PropOrDefault
             and display 'n/a' when the field is absent.
-    2.2.2 - Fixed validation polling returning TASK_NOT_FOUND: the result is served from the
-            un-scoped GET /v1/clusters/validations/{id}, not the cluster-scoped path used for
-            the POST. Polls the un-scoped path first and falls back to the scoped one, gives
-            up after 3 consecutive failures instead of spinning the full 300s, and prints the
-            manual GET URL. Result fields also read via Get-PropOrDefault.
+    2.2.2 - Validation polling: a TASK_NOT_FOUND on the first poll is transient (SDDC Manager
+            registers the validation task a moment after the POST returns) and no longer
+            prints as a warning. Gives up after 6 consecutive failures with the manual GET
+            URL instead of spinning the full 300s. Result fields (resultStatus,
+            validationChecks) read via Get-PropOrDefault - same StrictMode hazard as the
+            host list. Endpoints unchanged: POST and GET are both cluster-scoped.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -677,43 +678,33 @@ if ($MockMode) {
             $finalStatus = $null
             $poll        = $null
 
-            # The validation result is served from the UN-SCOPED collection in VCF 9.1:
-            # GET /v1/clusters/validations/{id}. The cluster-scoped path is only valid for
-            # the POST; polling it returns TASK_NOT_FOUND. Older builds accepted the scoped
-            # path, so try both and stay on whichever answers first.
-            $pollPaths    = @(
-                "/v1/clusters/validations/$validationId"
-                "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
-            )
-            $pollPath     = $null
+            # Status is tracked on the cluster-scoped path, same as the kickoff POST.
+            # SDDC Manager can answer TASK_NOT_FOUND for the first few seconds after the
+            # POST returns, before the validation task is registered - that is expected
+            # and transient, so early failures are reported quietly and retried.
+            $pollPath     = "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
             $failStreak   = 0
-            $maxFailures  = 3
+            $maxFailures  = 6
             $lastPollErr  = $null
 
             while ($elapsed -lt $maxWait) {
                 Start-Sleep -Seconds $interval
                 $elapsed += $interval
 
-                $candidates = if ($pollPath) { @($pollPath) } else { $pollPaths }
-                $polled     = $false
-                foreach ($path in $candidates) {
-                    try {
-                        $poll     = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $path
-                        $pollPath = $path
-                        $polled   = $true
-                        break
-                    } catch {
-                        $lastPollErr = $_
-                    }
-                }
-
-                if (-not $polled) {
+                try {
+                    $poll = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $pollPath
+                } catch {
+                    $lastPollErr = $_
                     $failStreak++
-                    Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $lastPollErr" -ForegroundColor Yellow
+                    if ($failStreak -eq 1) {
+                        Write-Host "    Elapsed: ${elapsed}s  |  validation task not registered yet, retrying ..." -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $lastPollErr" -ForegroundColor Yellow
+                    }
                     if ($failStreak -ge $maxFailures) {
-                        Write-Host "  Giving up on polling. The validation may still be running." -ForegroundColor Yellow
-                        Write-Host "  Check it manually:" -ForegroundColor Yellow
-                        Write-Host "    GET https://$SDDCManagerFQDN/v1/clusters/validations/$validationId" -ForegroundColor DarkGray
+                        Write-Host "  Giving up on polling after $failStreak consecutive failures." -ForegroundColor Yellow
+                        Write-Host "  The validation may still be running. Check it manually:" -ForegroundColor Yellow
+                        Write-Host "    GET https://$SDDCManagerFQDN$pollPath" -ForegroundColor DarkGray
                         break
                     }
                     continue

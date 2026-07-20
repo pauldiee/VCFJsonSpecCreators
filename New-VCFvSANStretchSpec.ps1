@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.4.0
+    Version : 2.4.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -58,6 +58,12 @@
             task. This is the real cause of the polling failure seen in the field; the
             2.2.2 note calling it a transient registration delay was wrong. Polling is now
             a fallback, entered only if the POST comes back still running.
+    2.4.1 - Explained the witness traffic prompt. It sets witnessTrafficSharedWithVsanTraffic,
+            which is the INVERSE of Witness Traffic Separation (WTS): n = WTS (witness
+            traffic separated, typically over the management VMkernel with a static route),
+            y = witness traffic rides the vSAN network. The old "(y/n, usually n)" hint gave
+            no way to tell which answer meant WTS. Also notes that this describes existing
+            host configuration - the spec does not create the VMkernel tagging or routes.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -73,7 +79,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "2.4.0"
+    Version = "2.4.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-10"
@@ -550,15 +556,33 @@ while ($edgeChoice -notin @('y', 'n')) {
 }
 $isEdgeClusterConfiguredForMultiAZ = ($edgeChoice -eq 'y')
 
+Write-Host ''
+Write-Host '  Witness traffic: which network do the data hosts use to reach the witness?' -ForegroundColor White
+Write-Host ''
+Write-Host '    n = Witness Traffic Separation (WTS).' -ForegroundColor White
+Write-Host '        Witness traffic is separated from vSAN data traffic - typically it' -ForegroundColor White
+Write-Host '        leaves over the management VMkernel with a static route to the witness,' -ForegroundColor White
+Write-Host '        so the vSAN network itself never has to be routed to the third site.' -ForegroundColor White
+Write-Host '        This is the common VCF design.' -ForegroundColor White
+Write-Host ''
+Write-Host '    y = Shared. Witness traffic rides the vSAN network itself, which then has' -ForegroundColor White
+Write-Host '        to be routed to the witness at the third site. No WTS.' -ForegroundColor White
+Write-Host ''
+Write-Host '  This describes how the hosts are ALREADY configured - the stretch spec does' -ForegroundColor White
+Write-Host '  not create the VMkernel tagging or the static routes. Answer to match reality,' -ForegroundColor White
+Write-Host '  or the witness will be unreachable after the stretch.' -ForegroundColor White
+Write-Host ''
+
 $witnessSharedChoice = ''
 while ($witnessSharedChoice -notin @('y', 'n')) {
-    $witnessSharedChoice = (Read-Host -Prompt 'Does witness traffic share the vSAN network? (y/n, usually n)').ToLower()
+    $witnessSharedChoice = (Read-Host -Prompt 'Does witness traffic share the vSAN network? (y = shared, n = WTS)').ToLower()
     if ($witnessSharedChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
 }
 $witnessTrafficSharedWithVsanTraffic = ($witnessSharedChoice -eq 'y')
 
-Write-Host ("  Edge multi-AZ: {0}  |  Witness traffic shared with vSAN: {1}" -f `
-    $isEdgeClusterConfiguredForMultiAZ, $witnessTrafficSharedWithVsanTraffic) -ForegroundColor Green
+$witnessModeLabel = if ($witnessTrafficSharedWithVsanTraffic) { 'shared with vSAN (no WTS)' } else { 'separated (WTS)' }
+Write-Host ("  Edge multi-AZ: {0}  |  Witness traffic: {1}" -f `
+    $isEdgeClusterConfiguredForMultiAZ, $witnessModeLabel) -ForegroundColor Green
 
 #endregion
 

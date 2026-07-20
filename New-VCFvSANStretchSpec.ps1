@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.2.0
+    Version : 2.2.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -34,6 +34,10 @@
             BOM-less UTF-8, which 5.1 decodes as ANSI, corrupting the tokenizer); gated
             -SkipCertificateCheck behind PSEdition -eq 'Core' so 5.1 falls back to the
             TrustAll ICertificatePolicy instead of failing on an unknown parameter
+    2.2.1 - Fixed a crash in the AZ2 host list: SDDC Manager omits storageType (and can omit
+            cpu/memory) on an unassigned host, and Set-StrictMode -Version Latest turns a
+            missing property into a terminating error. Reads now go through Get-PropOrDefault
+            and display 'n/a' when the field is absent.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -152,6 +156,21 @@ function Test-CIDR {
     param([string]$Value)
     if ($Value -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') { return $false }
     return (Test-IPAddress $Matches[1]) -and ([int]$Matches[2] -ge 1) -and ([int]$Matches[2] -le 32)
+}
+
+function Get-PropOrDefault {
+    # Set-StrictMode -Version Latest turns a missing property into a terminating error.
+    # SDDC Manager omits optional fields entirely (e.g. storageType on an unassigned host),
+    # so every read of an API-returned object must go through this.
+    param(
+        $Object,
+        [string]$Name,
+        $Default = 'n/a'
+    )
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop -or $null -eq $prop.Value) { return $Default }
+    return $prop.Value
 }
 
 function Test-VlanId {
@@ -399,12 +418,15 @@ if ($MockMode) {
 Write-Host '  Available unassigned hosts:' -ForegroundColor White
 $i = 1
 foreach ($h in $availHosts) {
+    $cores  = Get-PropOrDefault (Get-PropOrDefault $h 'cpu' $null) 'cores'
+    $memMB  = Get-PropOrDefault (Get-PropOrDefault $h 'memory' $null) 'totalCapacityMB' $null
+    $ramGB  = if ($null -eq $memMB) { 'n/a' } else { [math]::Round($memMB / 1024, 0) }
     Write-Host ("  [{0}] {1}  |  CPU: {2} cores  |  RAM: {3} GB  |  Storage: {4}" -f `
         $i,
-        $h.fqdn,
-        $h.cpu.cores,
-        [math]::Round($h.memory.totalCapacityMB / 1024, 0),
-        $h.storageType)
+        (Get-PropOrDefault $h 'fqdn'),
+        $cores,
+        $ramGB,
+        (Get-PropOrDefault $h 'storageType'))
     $i++
 }
 

@@ -13,7 +13,7 @@
 
 .NOTES
     Script  : New-VCFClusterSpec.ps1
-    Version : 2.0.0
+    Version : 2.1.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-03-23
@@ -42,6 +42,14 @@
                     from the network pool bound to the hosts at commission time)
                   * removed the transportType 'NSX' port group ('NSX' is not a legal enum value)
                   * removed the top-level networkPoolName (not part of the cluster spec)
+        2.1.0 - Replaced storage type DETECTION with a prompt. ESA vs OSA is a design choice
+                made at cluster creation ("Enable vSAN ESA" on the Storage page), not a host
+                property: /v1/hosts?status=UNASSIGNED_USEABLE does not return storageType at
+                all, confirmed against a live 9.1 appliance. The old block read that absent
+                field, so under Set-StrictMode it crashed - and any null-safe version of it
+                would have silently defaulted every cluster to OSA. The mixed-storage abort
+                is gone with it; it could never fire. Host list no longer shows a Storage
+                column and reads cpu/memory via Get-PropOrDefault. See issue #16.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -57,7 +65,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFClusterSpec.ps1"
-    Version = "2.0.0"
+    Version = "2.1.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-03-23"
@@ -117,28 +125,24 @@ $MockHosts = @(
     [PSCustomObject]@{
         id          = 'host-mock-001'
         fqdn        = 'esxi-01.vcf.lab'
-        storageType = 'ESA'
         cpu         = [PSCustomObject]@{ cores = 32 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 262144 }
     }
     [PSCustomObject]@{
         id          = 'host-mock-002'
         fqdn        = 'esxi-02.vcf.lab'
-        storageType = 'ESA'
         cpu         = [PSCustomObject]@{ cores = 32 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 262144 }
     }
     [PSCustomObject]@{
         id          = 'host-mock-003'
         fqdn        = 'esxi-03.vcf.lab'
-        storageType = 'ESA'
         cpu         = [PSCustomObject]@{ cores = 32 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 262144 }
     }
     [PSCustomObject]@{
         id          = 'host-mock-004'
         fqdn        = 'esxi-04.vcf.lab'
-        storageType = 'OSA'           # intentionally OSA - select with an ESA host to test mixed-storage abort
         cpu         = [PSCustomObject]@{ cores = 16 }
         memory      = [PSCustomObject]@{ totalCapacityMB = 131072 }
     }
@@ -181,6 +185,21 @@ function Test-IPAddress {
     $addr = $null
     return [System.Net.IPAddress]::TryParse($Value, [ref]$addr) -and
            $addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
+}
+
+function Get-PropOrDefault {
+    # Set-StrictMode -Version Latest turns a missing property into a terminating error.
+    # SDDC Manager omits optional fields entirely, so every read of an API-returned
+    # object must go through this.
+    param(
+        $Object,
+        [string]$Name,
+        $Default = 'n/a'
+    )
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop -or $null -eq $prop.Value) { return $Default }
+    return $prop.Value
 }
 
 function Test-VlanId {
@@ -414,12 +433,17 @@ Write-Host ''
 Write-Host '  Available unassigned hosts:' -ForegroundColor White
 $i = 1
 foreach ($h in $availHosts) {
-    Write-Host ("  [{0}] {1}  |  CPU: {2} cores  |  RAM: {3} GB  |  Storage: {4}" -f `
+    # No Storage column: /v1/hosts?status=UNASSIGNED_USEABLE does not return storageType,
+    # and ESA/OSA is prompted for as a design choice instead. CPU/RAM go through
+    # Get-PropOrDefault because StrictMode makes any absent field terminating.
+    $cores = Get-PropOrDefault (Get-PropOrDefault $h 'cpu' $null) 'cores'
+    $memMB = Get-PropOrDefault (Get-PropOrDefault $h 'memory' $null) 'totalCapacityMB' $null
+    $ramGB = if ($null -eq $memMB) { 'n/a' } else { [math]::Round($memMB / 1024, 0) }
+    Write-Host ("  [{0}] {1}  |  CPU: {2} cores  |  RAM: {3} GB" -f `
         $i,
-        $h.fqdn,
-        $h.cpu.cores,
-        [math]::Round($h.memory.totalCapacityMB / 1024, 0),
-        $h.storageType)
+        (Get-PropOrDefault $h 'fqdn'),
+        $cores,
+        $ramGB)
     $i++
 }
 
@@ -461,18 +485,27 @@ Write-Host "  $($selectedHosts.Count) host(s) selected:" -ForegroundColor Green
 foreach ($h in $selectedHosts) { Write-Host "    - $($h.fqdn)" }
 #endregion
 
-#region --- Step 4: Detect storage type ---
-Write-Host ("`n  [Step 4 of 7  --  Storage Type Detection]") -ForegroundColor Cyan
+#region --- Step 4: Storage type ---
+Write-Host ("`n  [Step 4 of 7  --  vSAN Storage Type]") -ForegroundColor Cyan
 
-$storageTypes = @($selectedHosts | Select-Object -ExpandProperty storageType -Unique)
-if ($storageTypes.Count -gt 1) {
-    Write-Host "  Mixed storage types detected across selected hosts: $($storageTypes -join ', ')" -ForegroundColor Red
-    Write-Host "  All hosts in a cluster must use the same storage type. Aborting." -ForegroundColor Red
-    exit 1
+# This is a DESIGN CHOICE, not something to detect. In the SDDC Manager UI it is the
+# "Enable vSAN ESA" checkbox on the Storage page: ticked = ESA, unticked = OSA.
+# It was previously read from $selectedHosts[].storageType, which does not exist on
+# unassigned hosts - /v1/hosts?status=UNASSIGNED_USEABLE never returns that field, so
+# the detection could not work and silently defaulted the cluster to OSA. See issue #16.
+Write-Host ''
+Write-Host '  vSAN ESA (Express Storage Architecture) or vSAN OSA (Original)?' -ForegroundColor White
+Write-Host '  ESA requires supported all-flash hardware and a compatible vSAN release.' -ForegroundColor White
+Write-Host '  This choice sets esaConfig.enabled in the payload and cannot be changed' -ForegroundColor White
+Write-Host '  after the cluster is created without rebuilding it.' -ForegroundColor White
+Write-Host ''
+
+$storageType = ''
+while ($storageType -notin @('ESA', 'OSA')) {
+    $storageType = (Read-Host -Prompt 'vSAN storage type (ESA/OSA)').ToUpper()
+    if ($storageType -notin @('ESA', 'OSA')) { Write-Host "  WARNING: Please enter ESA or OSA." -ForegroundColor Yellow }
 }
-
-$storageType = $storageTypes[0]
-Write-Host "  Storage type: $storageType" -ForegroundColor Green
+Write-Host "  Storage type: vSAN $storageType" -ForegroundColor Green
 #endregion
 
 #region --- Step 5: Cluster and vSAN configuration ---

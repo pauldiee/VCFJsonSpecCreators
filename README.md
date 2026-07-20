@@ -24,8 +24,8 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 
 | Script | Version | Purpose |
 |---|---|---|
-| `New-VCFWorkloadDomain.ps1` | 2.0.0 | Create a new workload domain |
-| `New-VCFClusterSpec.ps1` | 2.0.0 | Add a cluster to an existing workload domain |
+| `New-VCFWorkloadDomain.ps1` | 2.1.0 | Create a new workload domain |
+| `New-VCFClusterSpec.ps1` | 2.1.0 | Add a cluster to an existing workload domain |
 | `New-VCFvSANStretchSpec.ps1` | 2.4.1 | Stretch an existing vSAN cluster across two availability zones |
 | `New-VCFNetworkPool.ps1` | 2.8.0 | Create a network pool in SDDC Manager |
 
@@ -37,7 +37,7 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 
 1. **SDDC Manager connection** — authenticates and retrieves a Bearer token
 2. **Host selection** — queries unassigned commissioned hosts; accepts comma-separated or range input (e.g. `1-3`)
-3. **Storage type detection** — reads `storageType` from each selected host; aborts on mixed ESA/OSA
+3. **vSAN storage type** — prompts for ESA or OSA. This is a design choice (the "Enable vSAN ESA" checkbox in the UI), not a host property — `/v1/hosts?status=UNASSIGNED_USEABLE` does not return `storageType`
 4. **Domain and vCenter configuration** — domain name, vCenter FQDN/name/datacenter/cluster, IP, gateway, subnet mask, appliance size, root and admin passwords
 5. **VDS and network configuration** — VDS name and MTU, uplink names, vMotion/vSAN/NSX TEP VLAN IDs, optional static TEP IP pool or DHCP
 6. **NSX configuration** — deploy a new NSX Manager (1 or 3 nodes) or join an existing instance
@@ -94,7 +94,7 @@ JSON saved as `<domainName>-workload-domain-<timestamp>.json`.
 1. **SDDC Manager connection** — authenticates and retrieves a Bearer token
 2. **Target workload domain** — lists existing domains; select the one to add a cluster to
 3. **Host selection** — queries unassigned commissioned hosts; accepts comma-separated or range input
-4. **Storage type detection** — reads `storageType` from each selected host; aborts on mixed ESA/OSA
+4. **vSAN storage type** — prompts for ESA or OSA. This is a design choice (the "Enable vSAN ESA" checkbox in the UI), not a host property — `/v1/hosts?status=UNASSIGNED_USEABLE` does not return `storageType`
 5. **Cluster and vSAN configuration** — cluster name, vSAN datastore name, failures to tolerate (FTT 1 or 2)
 6. **VDS and network configuration** — VDS name and MTU, uplink names, vMotion/vSAN/NSX TEP VLAN IDs, optional static TEP IP pool or DHCP, network pool selection
 7. **Build, validate, and save** — assembles the JSON payload, validates via `POST /v1/clusters/validations`, saves to disk

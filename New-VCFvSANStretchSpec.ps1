@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.2.1
+    Version : 2.2.2
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -38,6 +38,11 @@
             cpu/memory) on an unassigned host, and Set-StrictMode -Version Latest turns a
             missing property into a terminating error. Reads now go through Get-PropOrDefault
             and display 'n/a' when the field is absent.
+    2.2.2 - Fixed validation polling returning TASK_NOT_FOUND: the result is served from the
+            un-scoped GET /v1/clusters/validations/{id}, not the cluster-scoped path used for
+            the POST. Polls the un-scoped path first and falls back to the scoped one, gives
+            up after 3 consecutive failures instead of spinning the full 300s, and prints the
+            manual GET URL. Result fields also read via Get-PropOrDefault.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -672,33 +677,71 @@ if ($MockMode) {
             $finalStatus = $null
             $poll        = $null
 
+            # The validation result is served from the UN-SCOPED collection in VCF 9.1:
+            # GET /v1/clusters/validations/{id}. The cluster-scoped path is only valid for
+            # the POST; polling it returns TASK_NOT_FOUND. Older builds accepted the scoped
+            # path, so try both and stay on whichever answers first.
+            $pollPaths    = @(
+                "/v1/clusters/validations/$validationId"
+                "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
+            )
+            $pollPath     = $null
+            $failStreak   = 0
+            $maxFailures  = 3
+            $lastPollErr  = $null
+
             while ($elapsed -lt $maxWait) {
                 Start-Sleep -Seconds $interval
                 $elapsed += $interval
-                try {
-                    $poll        = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
-                        -Path "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
-                    $finalStatus = $poll.executionStatus
-                    Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
-                    if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
-                } catch {
-                    Write-Host "  WARNING: Poll attempt failed: $_" -ForegroundColor Yellow
+
+                $candidates = if ($pollPath) { @($pollPath) } else { $pollPaths }
+                $polled     = $false
+                foreach ($path in $candidates) {
+                    try {
+                        $poll     = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $path
+                        $pollPath = $path
+                        $polled   = $true
+                        break
+                    } catch {
+                        $lastPollErr = $_
+                    }
                 }
+
+                if (-not $polled) {
+                    $failStreak++
+                    Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $lastPollErr" -ForegroundColor Yellow
+                    if ($failStreak -ge $maxFailures) {
+                        Write-Host "  Giving up on polling. The validation may still be running." -ForegroundColor Yellow
+                        Write-Host "  Check it manually:" -ForegroundColor Yellow
+                        Write-Host "    GET https://$SDDCManagerFQDN/v1/clusters/validations/$validationId" -ForegroundColor DarkGray
+                        break
+                    }
+                    continue
+                }
+
+                $failStreak  = 0
+                $finalStatus = Get-PropOrDefault $poll 'executionStatus' $null
+                Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
+                if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
             }
 
             Write-Host ''
             if ($finalStatus -eq 'COMPLETED') {
-                if ($poll.resultStatus -eq 'SUCCEEDED') {
+                $resultStatus = Get-PropOrDefault $poll 'resultStatus' $null
+                if ($resultStatus -eq 'SUCCEEDED') {
                     Write-Host "  Validation PASSED. Stretch spec JSON is ready for deployment." -ForegroundColor Green
                 } else {
-                    Write-Host "  Validation FAILED (resultStatus: $($poll.resultStatus))" -ForegroundColor Red
-                    if ($poll.validationChecks) {
+                    Write-Host "  Validation FAILED (resultStatus: $resultStatus)" -ForegroundColor Red
+                    $checks = Get-PropOrDefault $poll 'validationChecks' $null
+                    if ($checks) {
                         Write-Host ''
                         Write-Host '  Validation errors:' -ForegroundColor Red
-                        foreach ($check in $poll.validationChecks) {
-                            if ($check.resultStatus -ne 'SUCCEEDED') {
+                        foreach ($check in $checks) {
+                            if ((Get-PropOrDefault $check 'resultStatus' $null) -ne 'SUCCEEDED') {
                                 Write-Host ("    [{0}] {1} - {2}" -f `
-                                    $check.resultStatus, $check.description, $check.errorMessage) -ForegroundColor Red
+                                    (Get-PropOrDefault $check 'resultStatus'),
+                                    (Get-PropOrDefault $check 'description'),
+                                    (Get-PropOrDefault $check 'errorMessage')) -ForegroundColor Red
                             }
                         }
                     }

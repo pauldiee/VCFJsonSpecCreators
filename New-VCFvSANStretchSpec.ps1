@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.3.0
+    Version : 2.4.0
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -50,6 +50,14 @@
             The validation prompt is reworded to match ("Validate the JSON with this script?")
             since answering n now leaves you with a saved spec rather than nothing.
             Also fixed $ScriptMeta.Version, which was still reporting 2.2.0 in the banner.
+    2.4.0 - Read the validation result from the POST response instead of polling for it.
+            POST /v1/clusters/{id}/validations is SYNCHRONOUS: it returns the finished
+            Validation object (executionStatus, resultStatus, validationChecks). The script
+            discarded that and polled GET .../validations/{validationId}, which answers
+            TASK_NOT_FOUND because the validation completes before it is ever a queryable
+            task. This is the real cause of the polling failure seen in the field; the
+            2.2.2 note calling it a transient registration delay was wrong. Polling is now
+            a fallback, entered only if the POST comes back still running.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -65,7 +73,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "2.3.0"
+    Version = "2.4.0"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-10"
@@ -712,65 +720,55 @@ if ($MockMode) {
             $validationId = Get-PropOrDefault $validationResp 'id' $null
             Write-Host "  Validation submitted. ID: $validationId" -ForegroundColor Green
 
-            # The POST response shape decides which id is pollable. Keep it visible: a
-            # TASK_NOT_FOUND on the GET means this id is not the one the status endpoint
-            # wants, and without the raw body there is no way to tell which field is.
-            Write-Host "  POST response fields: $($validationResp.PSObject.Properties.Name -join ', ')" -ForegroundColor DarkGray
+            # The POST is SYNCHRONOUS: it returns the finished Validation object -
+            # executionStatus, resultStatus and validationChecks are all in this response.
+            # Do NOT poll it away. GET /v1/clusters/{id}/validations/{validationId}
+            # answers TASK_NOT_FOUND because the validation completes before it is ever
+            # a queryable task, which is exactly what bit us in the field.
+            $poll        = $validationResp
+            $finalStatus = Get-PropOrDefault $validationResp 'executionStatus' $null
 
-            Write-Host "  Polling for validation result ..." -ForegroundColor Cyan
+            # Only fall back to polling if it genuinely came back still running.
+            if ($finalStatus -notin @('COMPLETED', 'FAILED')) {
+                Write-Host "  Validation still running (status: $finalStatus). Polling ..." -ForegroundColor Cyan
 
-            $maxWait     = 300
-            $interval    = 10
-            $elapsed     = 0
-            $finalStatus = $null
-            $poll        = $null
-
-            # Status is tracked on the cluster-scoped path, same as the kickoff POST.
-            # SDDC Manager can answer TASK_NOT_FOUND for the first few seconds after the
-            # POST returns, before the validation task is registered - that is expected
-            # and transient, so early failures are reported quietly and retried.
-            $pollPath     = "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
-            $failStreak   = 0
-            $maxFailures  = 6
-            $lastPollErr  = $null
-
-            while ($elapsed -lt $maxWait) {
-                Start-Sleep -Seconds $interval
-                $elapsed += $interval
-
-                try {
-                    $poll = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $pollPath
-                } catch {
-                    $lastPollErr = $_
-                    $failStreak++
-                    if ($failStreak -eq 1) {
-                        Write-Host "    Elapsed: ${elapsed}s  |  validation task not registered yet, retrying ..." -ForegroundColor DarkGray
-                    } else {
-                        Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $lastPollErr" -ForegroundColor Yellow
-                    }
-                    if ($failStreak -ge $maxFailures) {
-                        Write-Host "  Giving up on polling after $failStreak consecutive failures." -ForegroundColor Yellow
-                        Write-Host "  The validation may still be running. Check it manually:" -ForegroundColor Yellow
-                        Write-Host "    GET https://$SDDCManagerFQDN$pollPath" -ForegroundColor DarkGray
-                        Write-Host ''
-                        Write-Host '  Raw POST response (which field is the pollable id?):' -ForegroundColor DarkGray
-                        Write-Host ($validationResp | ConvertTo-Json -Depth 5) -ForegroundColor DarkGray
-                        break
-                    }
-                    continue
-                }
-
+                $maxWait     = 300
+                $interval    = 10
+                $elapsed     = 0
+                $pollPath    = "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
                 $failStreak  = 0
-                $finalStatus = Get-PropOrDefault $poll 'executionStatus' $null
-                Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
-                if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
+                $maxFailures = 6
+
+                while ($elapsed -lt $maxWait) {
+                    Start-Sleep -Seconds $interval
+                    $elapsed += $interval
+
+                    try {
+                        $poll = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $pollPath
+                    } catch {
+                        $failStreak++
+                        Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $_" -ForegroundColor Yellow
+                        if ($failStreak -ge $maxFailures) {
+                            Write-Host "  Giving up on polling. Check it manually:" -ForegroundColor Yellow
+                            Write-Host "    GET https://$SDDCManagerFQDN$pollPath" -ForegroundColor DarkGray
+                            break
+                        }
+                        continue
+                    }
+
+                    $failStreak  = 0
+                    $finalStatus = Get-PropOrDefault $poll 'executionStatus' $null
+                    Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
+                    if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
+                }
             }
 
             Write-Host ''
             if ($finalStatus -eq 'COMPLETED') {
                 $resultStatus = Get-PropOrDefault $poll 'resultStatus' $null
                 if ($resultStatus -eq 'SUCCEEDED') {
-                    Write-Host "  Validation PASSED. Stretch spec JSON is ready for deployment." -ForegroundColor Green
+                    $passedChecks = @(Get-PropOrDefault $poll 'validationChecks' @())
+                    Write-Host "  Validation PASSED ($($passedChecks.Count) checks). Stretch spec JSON is ready for deployment." -ForegroundColor Green
                 } else {
                     Write-Host "  Validation FAILED (resultStatus: $resultStatus)" -ForegroundColor Red
                     $checks = Get-PropOrDefault $poll 'validationChecks' $null

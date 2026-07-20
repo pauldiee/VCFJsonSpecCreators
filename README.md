@@ -4,7 +4,7 @@
 >
 > **Testing status (VCF 9.1):**
 > - `New-VCFWorkloadDomain.ps1` and `New-VCFClusterSpec.ps1` — payloads POSTed to the `/validations` endpoints of a live VCF 9.1 SDDC Manager; both clear schema validation.
-> - `New-VCFvSANStretchSpec.ps1` — **used successfully on a live management domain**; the stretch completed. The workload-domain variant differs by one flag (`networkProfiles[].isDefault` = `false` for a workload domain, `true` for the management domain) and has not been exercised end-to-end yet.
+> - `New-VCFvSANStretchSpec.ps1` — **field-proven on both variants**; the stretch completed in each case. Management domain (`networkProfiles[].isDefault` = `true`) and workload domain (`isDefault` = `false`, confirmed 2026-07-20 on a live VCF 9.1 customer environment). That flag is the only payload difference between the two.
 > - `New-VCFNetworkPool.ps1` — used against a live SDDC Manager.
 >
 > Note that `clusterStretchSpec` is a different model from `DomainCreationSpec` and is legitimately shaped differently: its `nsxClusterSpec` takes `{ipAddressPoolsSpec, uplinkProfiles}` **directly** (no `nsxTClusterSpec` wrapper), and it uses lowercase `hostname`. Do not "fix" it to match the domain spec.
@@ -26,7 +26,7 @@ Run `HostPrep.ps1` and `Commission-VCFHosts.ps1` from **VCFHostPreparation** fir
 |---|---|---|
 | `New-VCFWorkloadDomain.ps1` | 2.0.0 | Create a new workload domain |
 | `New-VCFClusterSpec.ps1` | 2.0.0 | Add a cluster to an existing workload domain |
-| `New-VCFvSANStretchSpec.ps1` | 2.2.0 | Stretch an existing vSAN cluster across two availability zones |
+| `New-VCFvSANStretchSpec.ps1` | 2.4.1 | Stretch an existing vSAN cluster across two availability zones |
 | `New-VCFNetworkPool.ps1` | 2.8.0 | Create a network pool in SDDC Manager |
 
 ---
@@ -134,8 +134,20 @@ JSON saved as `<clusterName>-cluster-<timestamp>.json`.
 3. **Witness host configuration** — FQDN, vSAN IP address, and vSAN network CIDR for the witness appliance
 4. **Availability zone 2 host selection** — queries unassigned commissioned hosts for AZ2
 5. **Network configuration** — VDS name, uplink names, AZ2 NSX host TEP pool (CIDR, gateway, range, transport VLAN), and multi-AZ flags
-6. **Build, validate, and save** — assembles the `clusterStretchSpec` JSON payload, optionally validates via `POST /v1/clusters/{id}/validations`, saves to disk
-7. **Execute (optional)** — prompts for a stretch spec JSON file (defaults to the one just saved) and submits `PATCH /v1/clusters/{id}` after you confirm by typing the cluster name; reports the SDDC Manager task ID to monitor
+6. **Build and save** — assembles the `clusterStretchSpec` JSON payload and writes it to disk **before** validation, so a failed or interrupted validation costs a retry rather than the whole run
+7. **Validate (optional)** — `POST /v1/clusters/{id}/validations`. This call is **synchronous**: the response *is* the finished validation result (`executionStatus`, `resultStatus`, `validationChecks`). Do not poll `GET .../validations/{validationId}` for it — the validation completes before it is ever a queryable task, so that GET returns `TASK_NOT_FOUND`
+8. **Execute (optional)** — prompts for a stretch spec JSON file (defaults to the one just saved) and submits `PATCH /v1/clusters/{id}` after you confirm by typing the cluster name; reports the SDDC Manager task ID to monitor
+
+### Witness traffic (WTS)
+
+The witness traffic prompt sets `witnessTrafficSharedWithVsanTraffic`, which is the **inverse** of Witness Traffic Separation:
+
+| Answer | Flag | Meaning |
+|---|---|---|
+| `n` | `false` | **WTS.** Witness traffic is separated from vSAN data traffic — typically over the management VMkernel with a static route to the witness, so the vSAN network never has to be routed to the third site. The common VCF design. |
+| `y` | `true` | Witness traffic rides the vSAN network, which then has to be routed to the witness. No WTS. |
+
+This flag is **descriptive, not prescriptive** — it tells SDDC Manager how the hosts are already configured. The spec does not create the VMkernel tagging or the static routes. Validation will not catch a mismatch, because nothing in the payload is malformed; you find out when the witness is unreachable after the stretch.
 
 ### Usage
 

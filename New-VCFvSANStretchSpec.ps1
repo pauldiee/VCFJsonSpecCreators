@@ -15,7 +15,7 @@
 
 .NOTES
     Script  : New-VCFvSANStretchSpec.ps1
-    Version : 2.2.0
+    Version : 2.4.1
     Author  : Paul van Dieen
     Blog    : https://www.hollebollevsan.nl
     Date    : 2026-07-10
@@ -34,6 +34,36 @@
             BOM-less UTF-8, which 5.1 decodes as ANSI, corrupting the tokenizer); gated
             -SkipCertificateCheck behind PSEdition -eq 'Core' so 5.1 falls back to the
             TrustAll ICertificatePolicy instead of failing on an unknown parameter
+    2.2.1 - Fixed a crash in the AZ2 host list: SDDC Manager omits storageType (and can omit
+            cpu/memory) on an unassigned host, and Set-StrictMode -Version Latest turns a
+            missing property into a terminating error. Reads now go through Get-PropOrDefault
+            and display 'n/a' when the field is absent.
+    2.2.2 - Validation polling: a TASK_NOT_FOUND on the first poll is transient (SDDC Manager
+            registers the validation task a moment after the POST returns) and no longer
+            prints as a warning. Gives up after 6 consecutive failures with the manual GET
+            URL instead of spinning the full 300s. Result fields (resultStatus,
+            validationChecks) read via Get-PropOrDefault - same StrictMode hazard as the
+            host list. Endpoints unchanged: POST and GET are both cluster-scoped.
+    2.3.0 - The JSON is now written to disk BEFORE validation, not after. Validation is a long
+            round trip that can fail, time out or be interrupted, and the payload is 30+
+            prompts of work - a failed validation should cost a retry, not the whole run.
+            The validation prompt is reworded to match ("Validate the JSON with this script?")
+            since answering n now leaves you with a saved spec rather than nothing.
+            Also fixed $ScriptMeta.Version, which was still reporting 2.2.0 in the banner.
+    2.4.0 - Read the validation result from the POST response instead of polling for it.
+            POST /v1/clusters/{id}/validations is SYNCHRONOUS: it returns the finished
+            Validation object (executionStatus, resultStatus, validationChecks). The script
+            discarded that and polled GET .../validations/{validationId}, which answers
+            TASK_NOT_FOUND because the validation completes before it is ever a queryable
+            task. This is the real cause of the polling failure seen in the field; the
+            2.2.2 note calling it a transient registration delay was wrong. Polling is now
+            a fallback, entered only if the POST comes back still running.
+    2.4.1 - Explained the witness traffic prompt. It sets witnessTrafficSharedWithVsanTraffic,
+            which is the INVERSE of Witness Traffic Separation (WTS): n = WTS (witness
+            traffic separated, typically over the management VMkernel with a static route),
+            y = witness traffic rides the vSAN network. The old "(y/n, usually n)" hint gave
+            no way to tell which answer meant WTS. Also notes that this describes existing
+            host configuration - the spec does not create the VMkernel tagging or routes.
 
 .PARAMETER MockMode
     Run in mock mode: skips all SDDC Manager API calls and uses built-in stub data.
@@ -49,7 +79,7 @@ param(
 
 $ScriptMeta = @{
     Name    = "New-VCFvSANStretchSpec.ps1"
-    Version = "2.2.0"
+    Version = "2.4.1"
     Author  = "Paul van Dieen"
     Blog    = "https://www.hollebollevsan.nl"
     Date    = "2026-07-10"
@@ -152,6 +182,21 @@ function Test-CIDR {
     param([string]$Value)
     if ($Value -notmatch '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/(\d{1,2})$') { return $false }
     return (Test-IPAddress $Matches[1]) -and ([int]$Matches[2] -ge 1) -and ([int]$Matches[2] -le 32)
+}
+
+function Get-PropOrDefault {
+    # Set-StrictMode -Version Latest turns a missing property into a terminating error.
+    # SDDC Manager omits optional fields entirely (e.g. storageType on an unassigned host),
+    # so every read of an API-returned object must go through this.
+    param(
+        $Object,
+        [string]$Name,
+        $Default = 'n/a'
+    )
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -eq $prop -or $null -eq $prop.Value) { return $Default }
+    return $prop.Value
 }
 
 function Test-VlanId {
@@ -399,12 +444,15 @@ if ($MockMode) {
 Write-Host '  Available unassigned hosts:' -ForegroundColor White
 $i = 1
 foreach ($h in $availHosts) {
+    $cores  = Get-PropOrDefault (Get-PropOrDefault $h 'cpu' $null) 'cores'
+    $memMB  = Get-PropOrDefault (Get-PropOrDefault $h 'memory' $null) 'totalCapacityMB' $null
+    $ramGB  = if ($null -eq $memMB) { 'n/a' } else { [math]::Round($memMB / 1024, 0) }
     Write-Host ("  [{0}] {1}  |  CPU: {2} cores  |  RAM: {3} GB  |  Storage: {4}" -f `
         $i,
-        $h.fqdn,
-        $h.cpu.cores,
-        [math]::Round($h.memory.totalCapacityMB / 1024, 0),
-        $h.storageType)
+        (Get-PropOrDefault $h 'fqdn'),
+        $cores,
+        $ramGB,
+        (Get-PropOrDefault $h 'storageType'))
     $i++
 }
 
@@ -508,15 +556,33 @@ while ($edgeChoice -notin @('y', 'n')) {
 }
 $isEdgeClusterConfiguredForMultiAZ = ($edgeChoice -eq 'y')
 
+Write-Host ''
+Write-Host '  Witness traffic: which network do the data hosts use to reach the witness?' -ForegroundColor White
+Write-Host ''
+Write-Host '    n = Witness Traffic Separation (WTS).' -ForegroundColor White
+Write-Host '        Witness traffic is separated from vSAN data traffic - typically it' -ForegroundColor White
+Write-Host '        leaves over the management VMkernel with a static route to the witness,' -ForegroundColor White
+Write-Host '        so the vSAN network itself never has to be routed to the third site.' -ForegroundColor White
+Write-Host '        This is the common VCF design.' -ForegroundColor White
+Write-Host ''
+Write-Host '    y = Shared. Witness traffic rides the vSAN network itself, which then has' -ForegroundColor White
+Write-Host '        to be routed to the witness at the third site. No WTS.' -ForegroundColor White
+Write-Host ''
+Write-Host '  This describes how the hosts are ALREADY configured - the stretch spec does' -ForegroundColor White
+Write-Host '  not create the VMkernel tagging or the static routes. Answer to match reality,' -ForegroundColor White
+Write-Host '  or the witness will be unreachable after the stretch.' -ForegroundColor White
+Write-Host ''
+
 $witnessSharedChoice = ''
 while ($witnessSharedChoice -notin @('y', 'n')) {
-    $witnessSharedChoice = (Read-Host -Prompt 'Does witness traffic share the vSAN network? (y/n, usually n)').ToLower()
+    $witnessSharedChoice = (Read-Host -Prompt 'Does witness traffic share the vSAN network? (y = shared, n = WTS)').ToLower()
     if ($witnessSharedChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
 }
 $witnessTrafficSharedWithVsanTraffic = ($witnessSharedChoice -eq 'y')
 
-Write-Host ("  Edge multi-AZ: {0}  |  Witness traffic shared with vSAN: {1}" -f `
-    $isEdgeClusterConfiguredForMultiAZ, $witnessTrafficSharedWithVsanTraffic) -ForegroundColor Green
+$witnessModeLabel = if ($witnessTrafficSharedWithVsanTraffic) { 'shared with vSAN (no WTS)' } else { 'separated (WTS)' }
+Write-Host ("  Edge multi-AZ: {0}  |  Witness traffic: {1}" -f `
+    $isEdgeClusterConfiguredForMultiAZ, $witnessModeLabel) -ForegroundColor Green
 
 #endregion
 
@@ -614,86 +680,10 @@ $jsonOutput = $payload | ConvertTo-Json -Depth 20
 Write-Host "  JSON payload built successfully." -ForegroundColor Green
 #endregion
 
-#region --- Validate ---
-Write-Host ("`n  [Validation  --  SDDC Manager API]") -ForegroundColor Cyan
-
-if ($MockMode) {
-    Write-Host "  [MOCK] Skipping live validation. Returning mock SUCCEEDED result." -ForegroundColor DarkYellow
-    Write-Host ''
-    Write-Host "  Validation PASSED (mock). Stretch spec JSON is ready for review." -ForegroundColor Green
-} else {
-    $validateChoice = ''
-    while ($validateChoice -notin @('y', 'n')) {
-        $validateChoice = (Read-Host -Prompt 'Submit for validation against SDDC Manager? (y/n)').ToLower()
-        if ($validateChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
-    }
-
-    if ($validateChoice -eq 'y') {
-        Write-Host "  Submitting validation request to /v1/clusters/$($selectedCluster.id)/validations ..." -ForegroundColor Cyan
-        $validationBody = @{ clusterUpdateSpec = @{ clusterStretchSpec = $payload.clusterStretchSpec } }
-        $validationResp = $null
-        try {
-            $validationResp = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
-                -Method POST -Path "/v1/clusters/$($selectedCluster.id)/validations" -Body $validationBody
-        } catch {
-            Write-Host "  Validation request failed: $_" -ForegroundColor Red
-        }
-
-        if ($validationResp) {
-            $validationId = $validationResp.id
-            Write-Host "  Validation submitted. ID: $validationId" -ForegroundColor Green
-            Write-Host "  Polling for validation result ..." -ForegroundColor Cyan
-
-            $maxWait     = 300
-            $interval    = 10
-            $elapsed     = 0
-            $finalStatus = $null
-            $poll        = $null
-
-            while ($elapsed -lt $maxWait) {
-                Start-Sleep -Seconds $interval
-                $elapsed += $interval
-                try {
-                    $poll        = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
-                        -Path "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
-                    $finalStatus = $poll.executionStatus
-                    Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
-                    if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
-                } catch {
-                    Write-Host "  WARNING: Poll attempt failed: $_" -ForegroundColor Yellow
-                }
-            }
-
-            Write-Host ''
-            if ($finalStatus -eq 'COMPLETED') {
-                if ($poll.resultStatus -eq 'SUCCEEDED') {
-                    Write-Host "  Validation PASSED. Stretch spec JSON is ready for deployment." -ForegroundColor Green
-                } else {
-                    Write-Host "  Validation FAILED (resultStatus: $($poll.resultStatus))" -ForegroundColor Red
-                    if ($poll.validationChecks) {
-                        Write-Host ''
-                        Write-Host '  Validation errors:' -ForegroundColor Red
-                        foreach ($check in $poll.validationChecks) {
-                            if ($check.resultStatus -ne 'SUCCEEDED') {
-                                Write-Host ("    [{0}] {1} - {2}" -f `
-                                    $check.resultStatus, $check.description, $check.errorMessage) -ForegroundColor Red
-                            }
-                        }
-                    }
-                }
-            } elseif ($finalStatus -eq 'FAILED') {
-                Write-Host "  Validation execution itself failed. Check SDDC Manager logs." -ForegroundColor Red
-            } else {
-                Write-Host "  WARNING: Validation timed out after ${maxWait}s. Last status: $finalStatus" -ForegroundColor Yellow
-            }
-        }
-    } else {
-        Write-Host "  WARNING: Validation skipped. Review the JSON before deploying." -ForegroundColor Yellow
-    }
-}
-#endregion
-
 #region --- Save JSON to file ---
+# Written BEFORE validation on purpose: validation is a long round trip that can fail,
+# time out or be interrupted, and the payload is 30+ prompts of work. Get it on disk
+# first so a failed validation costs a retry, not the whole run.
 Write-Host ("`n  [Output  --  Saving JSON]") -ForegroundColor Cyan
 
 if ($OutputJsonPath -and $OutputJsonPath.Trim() -ne '') {
@@ -716,6 +706,119 @@ try {
     Write-Host "  JSON saved to: $OutputJsonPath" -ForegroundColor Green
 } catch {
     Write-Host "  Failed to save JSON: $_" -ForegroundColor Red
+}
+#endregion
+
+#region --- Validate ---
+Write-Host ("`n  [Validation  --  SDDC Manager API]") -ForegroundColor Cyan
+
+if ($MockMode) {
+    Write-Host "  [MOCK] Skipping live validation. Returning mock SUCCEEDED result." -ForegroundColor DarkYellow
+    Write-Host ''
+    Write-Host "  Validation PASSED (mock). Stretch spec JSON is ready for review." -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host '  The JSON is already saved. Validation is optional from here: the script can' -ForegroundColor White
+    Write-Host '  submit it and poll for the result, or you can validate it yourself in SDDC' -ForegroundColor White
+    Write-Host '  Manager and skip ahead to the execute step.' -ForegroundColor White
+    Write-Host ''
+
+    $validateChoice = ''
+    while ($validateChoice -notin @('y', 'n')) {
+        $validateChoice = (Read-Host -Prompt 'Validate the JSON with this script? (y/n)').ToLower()
+        if ($validateChoice -notin @('y', 'n')) { Write-Host "  WARNING: Please enter y or n." -ForegroundColor Yellow }
+    }
+
+    if ($validateChoice -eq 'y') {
+        Write-Host "  Submitting validation request to /v1/clusters/$($selectedCluster.id)/validations ..." -ForegroundColor Cyan
+        $validationBody = @{ clusterUpdateSpec = @{ clusterStretchSpec = $payload.clusterStretchSpec } }
+        $validationResp = $null
+        try {
+            $validationResp = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token `
+                -Method POST -Path "/v1/clusters/$($selectedCluster.id)/validations" -Body $validationBody
+        } catch {
+            Write-Host "  Validation request failed: $_" -ForegroundColor Red
+        }
+
+        if ($validationResp) {
+            $validationId = Get-PropOrDefault $validationResp 'id' $null
+            Write-Host "  Validation submitted. ID: $validationId" -ForegroundColor Green
+
+            # The POST is SYNCHRONOUS: it returns the finished Validation object -
+            # executionStatus, resultStatus and validationChecks are all in this response.
+            # Do NOT poll it away. GET /v1/clusters/{id}/validations/{validationId}
+            # answers TASK_NOT_FOUND because the validation completes before it is ever
+            # a queryable task, which is exactly what bit us in the field.
+            $poll        = $validationResp
+            $finalStatus = Get-PropOrDefault $validationResp 'executionStatus' $null
+
+            # Only fall back to polling if it genuinely came back still running.
+            if ($finalStatus -notin @('COMPLETED', 'FAILED')) {
+                Write-Host "  Validation still running (status: $finalStatus). Polling ..." -ForegroundColor Cyan
+
+                $maxWait     = 300
+                $interval    = 10
+                $elapsed     = 0
+                $pollPath    = "/v1/clusters/$($selectedCluster.id)/validations/$validationId"
+                $failStreak  = 0
+                $maxFailures = 6
+
+                while ($elapsed -lt $maxWait) {
+                    Start-Sleep -Seconds $interval
+                    $elapsed += $interval
+
+                    try {
+                        $poll = Invoke-SDDC -FQDN $SDDCManagerFQDN -Token $token -Path $pollPath
+                    } catch {
+                        $failStreak++
+                        Write-Host "  WARNING: Poll attempt failed ($failStreak/$maxFailures): $_" -ForegroundColor Yellow
+                        if ($failStreak -ge $maxFailures) {
+                            Write-Host "  Giving up on polling. Check it manually:" -ForegroundColor Yellow
+                            Write-Host "    GET https://$SDDCManagerFQDN$pollPath" -ForegroundColor DarkGray
+                            break
+                        }
+                        continue
+                    }
+
+                    $failStreak  = 0
+                    $finalStatus = Get-PropOrDefault $poll 'executionStatus' $null
+                    Write-Host "    Elapsed: ${elapsed}s  |  Status: $finalStatus" -ForegroundColor DarkGray
+                    if ($finalStatus -in @('COMPLETED', 'FAILED')) { break }
+                }
+            }
+
+            Write-Host ''
+            if ($finalStatus -eq 'COMPLETED') {
+                $resultStatus = Get-PropOrDefault $poll 'resultStatus' $null
+                if ($resultStatus -eq 'SUCCEEDED') {
+                    $passedChecks = @(Get-PropOrDefault $poll 'validationChecks' @())
+                    Write-Host "  Validation PASSED ($($passedChecks.Count) checks). Stretch spec JSON is ready for deployment." -ForegroundColor Green
+                } else {
+                    Write-Host "  Validation FAILED (resultStatus: $resultStatus)" -ForegroundColor Red
+                    $checks = Get-PropOrDefault $poll 'validationChecks' $null
+                    if ($checks) {
+                        Write-Host ''
+                        Write-Host '  Validation errors:' -ForegroundColor Red
+                        foreach ($check in $checks) {
+                            if ((Get-PropOrDefault $check 'resultStatus' $null) -ne 'SUCCEEDED') {
+                                Write-Host ("    [{0}] {1} - {2}" -f `
+                                    (Get-PropOrDefault $check 'resultStatus'),
+                                    (Get-PropOrDefault $check 'description'),
+                                    (Get-PropOrDefault $check 'errorMessage')) -ForegroundColor Red
+                            }
+                        }
+                    }
+                }
+            } elseif ($finalStatus -eq 'FAILED') {
+                Write-Host "  Validation execution itself failed. Check SDDC Manager logs." -ForegroundColor Red
+            } else {
+                Write-Host "  WARNING: Validation timed out after ${maxWait}s. Last status: $finalStatus" -ForegroundColor Yellow
+            }
+        }
+    } else {
+        Write-Host "  WARNING: Validation skipped. Review the JSON before deploying:" -ForegroundColor Yellow
+        Write-Host "    $OutputJsonPath" -ForegroundColor DarkGray
+    }
 }
 #endregion
 

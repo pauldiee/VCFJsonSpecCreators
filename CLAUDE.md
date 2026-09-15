@@ -127,6 +127,11 @@ The generated spec JSON contains **cleartext passwords** — vCenter root, SSO, 
 - Examples in `Examples/` use `<placeholder>` secrets and Rainpole-style values (`vcf.lab`, `192.168.x.x`) only — keep it that way
 - Delete the generated file once the domain is deployed
 
+**Customer data is never used with Claude on this repo, period, no
+exceptions.** No real customer names, credentials, or other identifying
+details are ever entered into a Claude session while working on this
+repo – not in chat text, not in a screenshot.
+
 ---
 
 ## Pre-commit checklist
